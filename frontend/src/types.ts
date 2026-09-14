@@ -18,24 +18,54 @@ export interface DlcRow {
   owned_dlc: DlcItem[]
   missing_dlc: DlcItem[]
   missing_count: number
+  owned_count: number
+  truncated: boolean
 }
 
 export interface DlcReport {
   games_with_dlc: number
   total_missing_dlc: number
   total_missing_price_cents: number
+  processed_games: number
+  total_games: number
+  capped: boolean
   rows: DlcRow[]
 }
 
 export interface Candidate {
   appid: number
   name: string
+  header_image: string
   genres: string
   categories: string
   price_cents: number
   positive: number
+  negative: number
+  rating: string
   metacritic_score: number
   distance: number
+  reason?: string
+}
+
+export interface Profile {
+  top_genres: string[]
+  top_categories: string[]
+  summary: string
+}
+
+export interface GameAnalysis {
+  appid: number
+  name: string
+  header_image: string
+  genres: string
+  categories: string
+  price_cents: number | null
+  positive: number
+  negative: number
+  rating: string
+  metacritic_score: number
+  match_genres: string[]
+  owned: boolean
 }
 
 export interface ChatMessage {
@@ -57,7 +87,9 @@ export type StreamEvent =
         text: string
         intent: string | null
         dlc_report: DlcReport | null
+        profile: Profile | null
         candidates: Candidate[] | null
+        game_analysis: GameAnalysis | null
       }
     }
   | { type: 'error'; data: string }

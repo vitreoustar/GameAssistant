@@ -1,7 +1,7 @@
-"""LangGraph Agent:意图路由 -> (DLC 整理 | 游戏推荐 | 闲聊)。
+"""LangGraph Agent:意图路由 -> (DLC 整理 | DLC 展开 | 游戏推荐 | 游戏评价 | 闲聊)。
 
 StateGraph 结构:
-    START -> route -> {dlc | recommend | chat} -> END
+    START -> route -> {dlc | dlc_detail | recommend | game_ask | chat} -> END
 """
 from __future__ import annotations
 
@@ -15,7 +15,9 @@ from langgraph.graph.message import add_messages
 
 from app.agent.prompts import (
     DLC_SUMMARY_PROMPT,
-    RECOMMEND_PROMPT,
+    EXTRACT_GAME_PROMPT,
+    GAME_ASK_PROMPT,
+    RECOMMEND_REASONS_PROMPT,
     ROUTER_PROMPT,
     SYSTEM_PROMPT,
 )
@@ -30,7 +32,9 @@ class AgentState(TypedDict):
     library: list[dict]
     intent: str
     dlc_report: dict | None
+    profile: dict | None
     candidates: list[dict]
+    game_analysis: dict | None
 
 
 def get_llm() -> ChatOpenAI:
@@ -79,7 +83,7 @@ async def route_node(state: AgentState) -> dict:
     except Exception:
         intent = _keyword_route(message)
 
-    if intent not in {"dlc", "recommend", "chat"}:
+    if intent not in {"dlc", "dlc_detail", "recommend", "game_ask", "chat"}:
         intent = "chat"
     return {"intent": intent}
 
@@ -88,7 +92,11 @@ def _keyword_route(message: str) -> str:
     """LLM 不可用时的关键词兜底路由。"""
     m = message.lower()
     if "dlc" in m:
+        if any(k in m for k in ("展开", "更多", "全部", "详细", "还有", "完整", "有哪些", "多少")):
+            return "dlc_detail"
         return "dlc"
+    if any(k in m for k in ("怎么样", "好不好玩", "好玩吗", "值得买", "值得玩", "评价", "如何")):
+        return "game_ask"
     if any(k in m for k in ("推荐", "recommend", "喜欢", "好玩", "类似")):
         return "recommend"
     return "chat"
@@ -103,15 +111,15 @@ def _route_after_intent(state: AgentState) -> str:
 async def dlc_node(state: AgentState) -> dict:
     games = state.get("library") or []
     if not games:
-        return {"messages": [AIMessage(content="我还不知道你的游戏库,请先在右侧连接你的 Steam 库。")]}
+        return {"messages": [AIMessage(content="先连接你的游戏库,我才能帮你整理 DLC 哦~")]}
 
-    report = await build_dlc_report(games)
+    report = await build_dlc_report(games, top_games=20, max_dlc_per_game=8)
     summary = _summarize_dlc(report)
     try:
         summary = await _llm_stream_text(
             [
                 SystemMessage(content=DLC_SUMMARY_PROMPT),
-                HumanMessage(content=json.dumps(report, ensure_ascii=False)),
+                HumanMessage(content=_dlc_context(report)),
             ]
         )
     except Exception:
@@ -120,61 +128,144 @@ async def dlc_node(state: AgentState) -> dict:
     return {"dlc_report": report, "messages": [AIMessage(content=summary)]}
 
 
-def _summarize_dlc(report: dict) -> str:
-    n = report.get("total_missing_dlc", 0)
-    total = report.get("total_missing_price_cents", 0)
-    games = report.get("games_with_dlc", 0)
-    lines = [f"你的游戏库中有 {games} 款游戏含 DLC,共缺 {n} 个 DLC。"]
-    if total:
-        lines.append(f"补齐这些 DLC 约需 ${total / 100:.2f}。")
-    for r in report.get("rows", [])[:5]:
-        if r.get("missing_dlc"):
-            names = "、".join(x["name"] for x in r["missing_dlc"][:2])
-            lines.append(f"- 《{r['name']}》缺 {len(r['missing_dlc'])} 个 DLC,如 {names}。")
+def _dlc_context(report: dict) -> str:
+    """把 DLC 报告转成自然语言上下文,避免 LLM 念出字段名。"""
+    lines: list[str] = []
+    if report.get("capped"):
+        lines.append(f"分析范围:你最常玩的 {report['processed_games']} 款(总共 {report['total_games']} 款)")
+    else:
+        lines.append(f"分析范围:你的全部 {report['total_games']} 款游戏")
+    lines.append(f"总共缺 {report['total_missing_dlc']} 个 DLC")
+    price = report.get("total_missing_price_cents", 0)
+    if price:
+        lines.append(f"已列出的未拥有 DLC 合计 ${price / 100:.2f}")
+    for r in report.get("rows", [])[:8]:
+        flag = "(列表有截断)" if r.get("truncated") else ""
+        names = "、".join(x["name"] for x in r["missing_dlc"][:3])
+        lines.append(f"- {r['name']}:缺 {r['missing_count']} 个{flag};比如 {names}")
     return "\n".join(lines)
 
 
-# ---------- 推荐 ----------
+def _summarize_dlc(report: dict) -> str:
+    """LLM 不可用时的确定性兜底摘要。"""
+    n = report.get("total_missing_dlc", 0)
+    price = report.get("total_missing_price_cents", 0)
+    lines: list[str] = []
+    if report.get("capped"):
+        lines.append(f"先帮你看了最常玩的 {report['processed_games']}/{report['total_games']} 款游戏~")
+    lines.append(f"这些游戏一共缺 {n} 个 DLC。")
+    if price:
+        lines.append(f"已列出的未拥有 DLC 合计约 ${price / 100:.2f}。")
+    for r in report.get("rows", [])[:5]:
+        if r.get("missing_dlc"):
+            names = "、".join(x["name"] for x in r["missing_dlc"][:2])
+            if r.get("truncated"):
+                lines.append(f"- 《{r['name']}》缺 {r['missing_count']} 个,比如 {names}…想细看可以再问我")
+            else:
+                lines.append(f"- 《{r['name']}》缺 {r['missing_count']} 个:{names}")
+    return "\n".join(lines)
 
-async def recommend_node(state: AgentState) -> dict:
+
+async def dlc_detail_node(state: AgentState) -> dict:
+    """用户追问时,展开某款游戏的完整 DLC 列表(支持中文/英文游戏名)。"""
     games = state.get("library") or []
     if not games:
-        return {"messages": [AIMessage(content="请先连接你的游戏库,我才能推荐。")]}
+        return {"messages": [AIMessage(content="先连接你的游戏库哦~")]}
 
-    queries = await _build_queries(games)
-    owned = {g["appid"] for g in games}
+    message = str(state["messages"][-1].content)
+    appids = await _resolve_game_appids(message, games)
+    if not appids:
+        by_play = sorted(games, key=lambda g: g.get("playtime_forever") or 0, reverse=True)[:3]
+        examples = "、".join(f"《{g['name']}》" for g in by_play)
+        return {
+            "messages": [
+                AIMessage(
+                    content=f"我好像没在你库里找到这款游戏,再说一下游戏名试试?比如 {examples}"
+                )
+            ]
+        }
 
-    candidates: dict[int, dict] = {}
-    for q in queries:
-        for r in rag_store.search(q, k=8, exclude=owned):
-            candidates[r["appid"]] = r
-    cand_list = sorted(candidates.values(), key=lambda x: x["distance"])[:15]
+    report = await build_dlc_report(
+        games, top_games=None, max_dlc_per_game=None, only_appids=appids
+    )
+    summary = _summarize_dlc_detail(report)
+    return {"dlc_report": report, "messages": [AIMessage(content=summary)]}
 
-    text = _fallback_recommend(cand_list)
+
+def _find_games_mentioned(message: str, games: list[dict]) -> list[int]:
+    m = message.lower()
+    return [g["appid"] for g in games if (g.get("name") or "").lower() in m]
+
+
+async def _resolve_game_appids(message: str, games: list[dict]) -> list[int]:
+    """解析用户提到的游戏:先英文名子串匹配,再 LLM 提取 + 商店搜索(支持中文名)。"""
+    appids = _find_games_mentioned(message, games)
+    if appids:
+        return appids
+
+    name = await _extract_game_name(message)
+    if not name:
+        return []
+
+    library_ids = {g["appid"] for g in games}
     try:
-        text = await _llm_stream_text(
+        lang = "schinese" if _has_cjk(name) else "english"
+        items = await steam_client.search_store(name, lang=lang)
+    except Exception:
+        return []
+    for it in items:
+        if it.get("id") in library_ids:
+            return [it["id"]]
+    return []
+
+
+def _has_cjk(s: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in s)
+
+
+async def _extract_game_name(message: str) -> str:
+    if not settings.deepseek_api_key:
+        return ""
+    try:
+        llm = get_llm()
+        resp = await llm.ainvoke(
             [
-                SystemMessage(content="你是游戏推荐助手,输出用中文。"),
-                HumanMessage(
-                    content=RECOMMEND_PROMPT.format(
-                        library=_format_library(games),
-                        candidates=_format_candidates(cand_list),
-                    )
-                ),
+                SystemMessage(content=EXTRACT_GAME_PROMPT.format(message=message)),
+                HumanMessage(content=message),
             ]
         )
+        name = str(resp.content or "").strip()
+        if name.lower() in {"", "无", "空", "null", "none"}:
+            return ""
+        return name
     except Exception:
-        pass
-
-    return {"candidates": cand_list, "messages": [AIMessage(content=text)]}
+        return ""
 
 
-async def _build_queries(games: list[dict]) -> list[str]:
-    """从用户库构建检索查询:热门类型 + 代表游戏相似查询。"""
-    owned_ids = [g["appid"] for g in games[:20]]
-    details = await steam_client.get_many_app_details(owned_ids)
+def _summarize_dlc_detail(report: dict) -> str:
+    if not report.get("rows"):
+        return "没有找到相关游戏的 DLC 信息。"
+    lines: list[str] = []
+    for r in report["rows"]:
+        total = r["owned_count"] + r["missing_count"]
+        lines.append(f"《{r['name']}》一共有 {total} 个 DLC:")
+        for x in r["missing_dlc"]:
+            price = f" ${x['price_cents'] / 100:.2f}" if x["price_cents"] is not None else "(免费)"
+            lines.append(f"  · 未拥有:{x['name']}{price}")
+        if r["owned_dlc"]:
+            lines.append(f"  · 已拥有 {r['owned_count']} 个,比如 {r['owned_dlc'][0]['name']}")
+    return "\n".join(lines)
+
+
+# ---------- 用户画像 & 推荐 ----------
+
+async def _build_profile(games: list[dict]) -> dict:
+    """从用户库统计类型/玩法偏好,生成画像。"""
+    ids = [g["appid"] for g in games[:30]]
+    details = await steam_client.get_many_app_details(ids)
 
     genre_counter: dict[str, int] = {}
+    cat_counter: dict[str, int] = {}
     for d in details.values():
         if not d:
             continue
@@ -182,36 +273,185 @@ async def _build_queries(games: list[dict]) -> list[str]:
             desc = item.get("description") if isinstance(item, dict) else item
             if desc:
                 genre_counter[desc] = genre_counter.get(desc, 0) + 1
+        for item in d.get("categories") or []:
+            desc = item.get("description") if isinstance(item, dict) else item
+            if desc:
+                cat_counter[desc] = cat_counter.get(desc, 0) + 1
 
-    top_genres = sorted(genre_counter, key=genre_counter.get, reverse=True)[:3]
+    top_genres = sorted(genre_counter, key=genre_counter.get, reverse=True)[:6]
+    top_cats = sorted(cat_counter, key=cat_counter.get, reverse=True)[:6]
+    summary = f"偏爱类型:{'、'.join(top_genres) or '暂无'};常见玩法:{'、'.join(top_cats) or '暂无'}"
+    return {"top_genres": top_genres, "top_categories": top_cats, "summary": summary}
+
+
+def _build_queries(profile: dict, games: list[dict]) -> list[str]:
     queries: list[str] = []
-    if top_genres:
-        queries.append(f"Games in genres: {', '.join(top_genres)}")
-
+    if profile.get("top_genres"):
+        queries.append(f"Games in genres: {', '.join(profile['top_genres'][:3])}")
     by_play = sorted(games, key=lambda x: x.get("playtime_forever") or 0, reverse=True)
     for g in by_play[:3]:
         queries.append(f"Games similar to {g['name']}")
     return queries[:4]
 
 
-def _format_library(games: list[dict]) -> str:
-    by_play = sorted(games, key=lambda x: x.get("playtime_forever") or 0, reverse=True)
-    return ", ".join(g["name"] for g in by_play[:15])
+async def recommend_node(state: AgentState) -> dict:
+    games = state.get("library") or []
+    if not games:
+        return {"messages": [AIMessage(content="先连接你的游戏库,我才能推荐哦~")]}
+
+    profile = await _build_profile(games)
+    owned = {g["appid"] for g in games}
+
+    candidates: dict[int, dict] = {}
+    for q in _build_queries(profile, games):
+        for r in rag_store.search(q, k=8, exclude=owned):
+            candidates[r["appid"]] = r
+    cand_list = sorted(candidates.values(), key=lambda x: x["distance"])[:8]
+
+    intro, reasons = await _generate_reasons(profile, cand_list)
+    for c in cand_list:
+        c["reason"] = reasons.get(c["appid"]) or _fallback_reason(c, profile)
+
+    text = intro or _fallback_recommend(cand_list)
+    return {"profile": profile, "candidates": cand_list, "messages": [AIMessage(content=text)]}
 
 
-def _format_candidates(candidates: list[dict]) -> str:
-    lines = []
-    for c in candidates:
-        price = f"${c.get('price_cents', 0) / 100:.2f}"
-        lines.append(f"- {c['name']} | {c.get('genres', '')} | {price} | {c.get('positive', 0)} 好评")
-    return "\n".join(lines)
+async def _generate_reasons(profile: dict, candidates: list[dict]) -> tuple[str, dict[int, str]]:
+    """LLM 生成开场白 + 每款候选的推荐理由(JSON)。"""
+    if not settings.deepseek_api_key:
+        return "", {}
+    lines = [f"- {c['appid']} | {c['name']} | {c['genres']}" for c in candidates]
+    human = f"用户偏好:\n{profile['summary']}\n\n候选游戏:\n" + "\n".join(lines)
+    try:
+        llm = get_llm().bind(response_format={"type": "json_object"})
+        resp = await llm.ainvoke(
+            [SystemMessage(content=RECOMMEND_REASONS_PROMPT), HumanMessage(content=human)]
+        )
+        data = json.loads(str(resp.content or ""))
+        intro = str(data.get("intro", ""))
+        reasons: dict[int, str] = {}
+        for r in data.get("reasons", []):
+            if r.get("appid"):
+                reasons[int(r["appid"])] = str(r.get("reason", ""))
+        return intro, reasons
+    except Exception:
+        return "", {}
+
+
+def _fallback_reason(candidate: dict, profile: dict) -> str:
+    genres = candidate.get("genres", "")
+    top = "、".join(profile.get("top_genres", [])[:2]) or "你的偏好"
+    return f"类型「{genres}」和 {top} 相近。"
 
 
 def _fallback_recommend(candidates: list[dict]) -> str:
     if not candidates:
-        return "暂时没有找到合适的推荐,请确认已连接游戏库。"
+        return "暂时没找到合适的推荐,确认已连接游戏库再试?"
     names = "、".join(f"《{c['name']}》" for c in candidates[:5])
-    return f"根据你的游戏库,推荐你试试:{names}。"
+    return f"根据你的喜好,我挑了这几款 🎮:{names}。"
+
+
+# ---------- 游戏评价(game_ask) ----------
+
+async def game_ask_node(state: AgentState) -> dict:
+    games = state.get("library") or []
+    message = str(state["messages"][-1].content)
+
+    name = await _extract_game_name(message)
+    if not name:
+        return {"messages": [AIMessage(content="你想问哪款游戏?把名字告诉我,比如「赛博朋克2077怎么样」")]}
+
+    appid = await _resolve_any_game(name)
+    if appid is None:
+        return {"messages": [AIMessage(content=f"没找到《{name}》,换个名字试试?")]}
+
+    details = await steam_client.get_app_details(appid)
+    if not details:
+        return {"messages": [AIMessage(content="没查到这款游戏的详细信息。")]}
+
+    profile = (
+        await _build_profile(games)
+        if games
+        else {"top_genres": [], "top_categories": [], "summary": "暂无游戏库"}
+    )
+
+    game_genres = {g.get("description", "") for g in details.get("genres") or []}
+    match_genres = sorted(game_genres & set(profile.get("top_genres") or []))
+    owned = appid in {g["appid"] for g in games}
+
+    meta = rag_store.get_game(appid)
+    rating = meta["rating"] if meta else "评价较少"
+    header = (details.get("header_image") or "") or (meta.get("header_image") if meta else "")
+
+    game_info = _format_game_info(details, meta, match_genres, owned)
+    text = "我先看看这款游戏~"
+    try:
+        text = await _llm_stream_text(
+            [
+                SystemMessage(content=GAME_ASK_PROMPT),
+                HumanMessage(content=f"游戏信息:\n{game_info}\n\n用户偏好:\n{profile['summary']}"),
+            ]
+        )
+    except Exception:
+        text = _fallback_game_ask(details, meta, match_genres, owned)
+
+    price = (details.get("price_overview") or {}).get("final")
+    analysis = {
+        "appid": appid,
+        "name": details.get("name", ""),
+        "header_image": header,
+        "genres": ", ".join(g.get("description", "") for g in details.get("genres") or []),
+        "categories": ", ".join(c.get("description", "") for c in details.get("categories") or []),
+        "price_cents": price,
+        "positive": meta.get("positive", 0) if meta else 0,
+        "negative": meta.get("negative", 0) if meta else 0,
+        "rating": rating,
+        "metacritic_score": meta.get("metacritic_score", 0) if meta else 0,
+        "match_genres": match_genres,
+        "owned": owned,
+    }
+    return {"game_analysis": analysis, "messages": [AIMessage(content=text)]}
+
+
+async def _resolve_any_game(name: str) -> int | None:
+    """解析任意游戏名(不限用户库) -> appid。"""
+    try:
+        lang = "schinese" if _has_cjk(name) else "english"
+        items = await steam_client.search_store(name, lang=lang)
+        if items:
+            return items[0]["id"]
+    except Exception:
+        pass
+    return None
+
+
+def _format_game_info(details: dict, meta: dict | None, match_genres: list[str], owned: bool) -> str:
+    name = details.get("name", "")
+    genres = ", ".join(g.get("description", "") for g in details.get("genres") or [])
+    cats = ", ".join(c.get("description", "") for c in details.get("categories") or [])
+    price = (details.get("price_overview") or {}).get("final")
+    price_s = f"${price / 100:.2f}" if price is not None else "免费"
+    rating = meta["rating"] if meta else "评价较少"
+    desc = (details.get("short_description") or "").strip()[:200]
+    lines = [f"游戏名:{name}", f"类型:{genres}", f"玩法/特性:{cats}", f"价格:{price_s}", f"评价:{rating}"]
+    if desc:
+        lines.append(f"简介:{desc}")
+    lines.append(f"用户是否已拥有:{'是' if owned else '否'}")
+    if match_genres:
+        lines.append(f"与用户偏好重叠的类型:{'、'.join(match_genres)}")
+    return "\n".join(lines)
+
+
+def _fallback_game_ask(details: dict, meta: dict | None, match_genres: list[str], owned: bool) -> str:
+    name = details.get("name", "")
+    genres = ", ".join(g.get("description", "") for g in details.get("genres") or [])
+    rating = meta["rating"] if meta else "评价较少"
+    if match_genres:
+        m = f"它和你的偏好挺合的,重叠类型有:{'、'.join(match_genres)}。"
+    else:
+        m = "它和你常玩的类型交集不大,可以观望一下。"
+    own = "你已经拥有这款游戏啦。" if owned else ""
+    return f"《{name}》类型:{genres}。评价:{rating}。{m}{own}"
 
 
 # ---------- 闲聊 ----------
@@ -236,18 +476,25 @@ def build_graph():
     g = StateGraph(AgentState)
     g.add_node("route", route_node)
     g.add_node("dlc", dlc_node)
+    g.add_node("dlc_detail", dlc_detail_node)
     g.add_node("recommend", recommend_node)
+    g.add_node("game_ask", game_ask_node)
     g.add_node("chat", chat_node)
 
     g.add_edge(START, "route")
     g.add_conditional_edges(
         "route",
         _route_after_intent,
-        {"dlc": "dlc", "recommend": "recommend", "chat": "chat"},
+        {
+            "dlc": "dlc",
+            "dlc_detail": "dlc_detail",
+            "recommend": "recommend",
+            "game_ask": "game_ask",
+            "chat": "chat",
+        },
     )
-    g.add_edge("dlc", END)
-    g.add_edge("recommend", END)
-    g.add_edge("chat", END)
+    for n in ("dlc", "dlc_detail", "recommend", "game_ask", "chat"):
+        g.add_edge(n, END)
     return g.compile()
 
 

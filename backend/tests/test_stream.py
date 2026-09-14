@@ -33,7 +33,7 @@ class FakeLLM:
 
     async def astream(self, messages, **kwargs):
         sys_msg = str(messages[0].content) if messages else ""
-        if "DLC 报告" in sys_msg:
+        if "DLC 信息" in sys_msg:
             yield FakeChunk("这是")
             yield FakeChunk("DLC 摘要")
         else:

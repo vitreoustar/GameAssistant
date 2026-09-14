@@ -79,6 +79,7 @@ def main() -> None:
     metacritic = table.column("metacritic_score").to_pylist()
     release = table.column("release_date").to_pylist()
     dlc_count = table.column("dlc_count").to_pylist()
+    header_image = table.column("header_image").to_pylist()
     # parquet 中列表列名统一为 element:35=Categories, 36=Genres
     categories = table.column(35).to_pylist()
     genres = table.column(36).to_pylist()
@@ -106,6 +107,7 @@ def main() -> None:
                 "release_date": release[i],
                 "dlc_count": dlc_count[i] or 0,
                 "estimated_owners": owners[i],
+                "header_image": header_image[i] or "",
             }
         )
 

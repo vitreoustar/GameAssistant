@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from langchain_core.messages import HumanMessage
 
@@ -27,14 +28,14 @@ class FakeLLM:
     async def ainvoke(self, messages, **kwargs) -> FakeResp:
         sys_msg = str(messages[0].content) if messages else ""
         human = str(messages[-1].content) if messages else ""
-        if "判断用户意图" in sys_msg:
+        if "意图" in sys_msg:
             h = human.lower()
             if "dlc" in h:
                 return FakeResp('{"intent":"dlc"}')
             if "推荐" in h or "recommend" in h:
                 return FakeResp('{"intent":"recommend"}')
             return FakeResp('{"intent":"chat"}')
-        if "DLC 报告" in sys_msg:
+        if "DLC 信息" in sys_msg:
             return FakeResp("(测试)这是 DLC 摘要。")
         if "推荐助手" in sys_msg:
             return FakeResp("(测试)这是推荐结果。")

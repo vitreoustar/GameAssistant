@@ -45,7 +45,6 @@ SteamAssistant/
 │  ├─ scripts/        # build_corpus.py / build_index.py
 │  ├─ data/           # 语料 + 向量库(已 gitignore,需本地构建)
 │  └─ .env.example
-├─ demo/              # 演示资源
 └─ PLAN.md
 ```
 
@@ -102,7 +101,7 @@ npm run dev
 
 ## 功能说明
 
-- **游戏库导入**:SteamID(需 key)
+- **游戏库导入**:SteamID 导入(需 key + 资料公开),内置获取 SteamID 引导弹窗
 - **DLC 整理**:列出每款游戏的已拥有 / 未拥有 DLC 与价格,汇总补齐总价
 - **游戏推荐**:从你的库中提取类型画像 → 语义检索相似游戏 → LLM 生成个性化推荐 + 理由
 - **流式输出**:聊天中实时展示 agent 中间步骤(route/dlc/recommend)与 token 流

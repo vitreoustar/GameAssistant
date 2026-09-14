@@ -2,10 +2,11 @@ import { useCallback, useState } from 'react'
 import './App.css'
 import ChatPanel from './components/ChatPanel'
 import DlcPanel from './components/DlcPanel'
+import GameAnalysisPanel from './components/GameAnalysisPanel'
 import LibraryPanel from './components/LibraryPanel'
 import RecommendPanel from './components/RecommendPanel'
 import { streamChat } from './api'
-import type { Candidate, ChatMessage, DlcReport, Game, Step } from './types'
+import type { Candidate, ChatMessage, DlcReport, Game, GameAnalysis, Profile, Step } from './types'
 
 function appendAssistant(ms: ChatMessage[], text: string): ChatMessage[] {
   const copy = [...ms]
@@ -36,6 +37,8 @@ export default function App() {
   const [streaming, setStreaming] = useState(false)
   const [dlcReport, setDlcReport] = useState<DlcReport | null>(null)
   const [candidates, setCandidates] = useState<Candidate[]>([])
+  const [profile, setProfile] = useState<Profile | null>(null)
+  const [gameAnalysis, setGameAnalysis] = useState<GameAnalysis | null>(null)
 
   const send = useCallback(
     async (text: string) => {
@@ -46,6 +49,10 @@ export default function App() {
         { role: 'assistant', content: '' },
       ])
       setSteps([])
+      setDlcReport(null)
+      setCandidates([])
+      setProfile(null)
+      setGameAnalysis(null)
       setStreaming(true)
       try {
         await streamChat(text, library, (ev) => {
@@ -60,7 +67,9 @@ export default function App() {
           } else if (ev.type === 'done') {
             setMessages((m) => setAssistant(m, ev.data.text))
             setDlcReport(ev.data.dlc_report)
+            setProfile(ev.data.profile)
             setCandidates(ev.data.candidates || [])
+            setGameAnalysis(ev.data.game_analysis)
           } else if (ev.type === 'error') {
             setMessages((m) => setAssistant(m, '⚠️ ' + ev.data))
           }
@@ -87,7 +96,8 @@ export default function App() {
         <aside className="side-panel">
           <LibraryPanel games={library} onLoaded={setLibrary} />
           <DlcPanel report={dlcReport} />
-          <RecommendPanel candidates={candidates} />
+          <RecommendPanel profile={profile} candidates={candidates} />
+          <GameAnalysisPanel analysis={gameAnalysis} />
         </aside>
       </main>
     </div>

@@ -13,9 +13,9 @@ from langchain_core.messages import HumanMessage
 
 from app.agent import agent
 
-NODE_NAMES = {"route", "dlc", "recommend", "chat"}
+NODE_NAMES = {"route", "dlc", "dlc_detail", "recommend", "game_ask", "chat"}
 # 只有这些节点的 token 才向前端流式输出(route 的内部 JSON 不外泄)
-STREAM_NODES = {"dlc", "recommend", "chat"}
+STREAM_NODES = {"dlc", "recommend", "game_ask", "chat"}
 
 
 async def stream_agent(message: str, library: list[dict]) -> AsyncIterator[dict]:
@@ -55,6 +55,8 @@ async def stream_agent(message: str, library: list[dict]) -> AsyncIterator[dict]
             "text": text,
             "intent": final_state.get("intent"),
             "dlc_report": final_state.get("dlc_report"),
+            "profile": final_state.get("profile"),
             "candidates": final_state.get("candidates"),
+            "game_analysis": final_state.get("game_analysis"),
         },
     }

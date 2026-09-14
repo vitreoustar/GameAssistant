@@ -136,11 +136,15 @@ class SteamClient:
             for g in games
         ]
 
-    async def search_store(self, term: str) -> list[dict]:
-        """Store 搜索接口(替代已下线的 GetAppList),按名称搜索。"""
+    async def search_store(self, term: str, lang: str = "english") -> list[dict]:
+        """Store 搜索接口(替代已下线的 GetAppList),按名称搜索。
+
+        lang 支持 english / schinese,中文名搜索需用 schinese。
+        """
+        cc = "cn" if lang == "schinese" else "us"
         data = await self._get_json(
             f"{STORE_API}/storesearch/",
-            {"term": term, "l": "english", "cc": "us"},
+            {"term": term, "l": lang, "cc": cc},
         )
         return (data or {}).get("items") or []
 

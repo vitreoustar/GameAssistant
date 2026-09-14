@@ -25,6 +25,25 @@ def get_client() -> chromadb.ClientAPI:
     return _client
 
 
+def rating_text(positive: int, negative: int) -> str:
+    """Steam 好评率 -> 中文评价标签。"""
+    total = (positive or 0) + (negative or 0)
+    if total < 50:
+        return "评价较少"
+    pct = (positive or 0) / total * 100
+    if pct >= 95:
+        return "好评如潮"
+    if pct >= 80:
+        return "特别好评"
+    if pct >= 70:
+        return "多半好评"
+    if pct >= 40:
+        return "褒贬不一"
+    if pct >= 20:
+        return "多半差评"
+    return "差评如潮"
+
+
 def _scalar_metadata(doc: dict) -> dict:
     """Chroma metadata 只接受标量,列表字段转成逗号字符串。"""
     return {
@@ -38,6 +57,7 @@ def _scalar_metadata(doc: dict) -> dict:
         "release_date": doc.get("release_date", "") or "",
         "dlc_count": doc.get("dlc_count", 0),
         "estimated_owners": doc.get("estimated_owners", "") or "",
+        "header_image": doc.get("header_image", "") or "",
     }
 
 
@@ -67,8 +87,26 @@ def build_index(corpus_path: Path | str) -> int:
     return len(docs)
 
 
+def _to_result(doc_id: str, meta: dict, distance: float | None = None) -> dict:
+    pos = meta.get("positive", 0)
+    neg = meta.get("negative", 0)
+    return {
+        "appid": int(doc_id),
+        "name": meta.get("name", ""),
+        "header_image": meta.get("header_image", ""),
+        "genres": meta.get("genres", ""),
+        "categories": meta.get("categories", ""),
+        "price_cents": meta.get("price_cents", 0),
+        "positive": pos,
+        "negative": neg,
+        "rating": rating_text(pos, neg),
+        "metacritic_score": meta.get("metacritic_score", 0),
+        "distance": distance,
+    }
+
+
 def search(query: str, k: int = 10, exclude: set[int] | None = None) -> list[dict]:
-    """语义检索 top-k,返回 [{appid, name, genres, categories, price_cents, positive, metacritic_score, distance}]。"""
+    """语义检索 top-k。"""
     client = get_client()
     try:
         col = client.get_collection(COLLECTION)
@@ -80,24 +118,24 @@ def search(query: str, k: int = 10, exclude: set[int] | None = None) -> list[dic
     exclude = exclude or set()
 
     results: list[dict] = []
-    ids = res["ids"][0]
-    metas = res["metadatas"][0]
-    dists = res["distances"][0]
-    for i, doc_id in enumerate(ids):
+    for i, doc_id in enumerate(res["ids"][0]):
         appid = int(doc_id)
         if appid in exclude:
             continue
-        m = metas[i] or {}
-        results.append(
-            {
-                "appid": appid,
-                "name": m.get("name", ""),
-                "genres": m.get("genres", ""),
-                "categories": m.get("categories", ""),
-                "price_cents": m.get("price_cents", 0),
-                "positive": m.get("positive", 0),
-                "metacritic_score": m.get("metacritic_score", 0),
-                "distance": dists[i],
-            }
-        )
+        meta = res["metadatas"][0][i] or {}
+        dist = res["distances"][0][i]
+        results.append(_to_result(doc_id, meta, dist))
     return results
+
+
+def get_game(appid: int) -> dict | None:
+    """按 appid 取单款游戏的元数据(用于「某游戏怎么样」)。"""
+    client = get_client()
+    try:
+        col = client.get_collection(COLLECTION)
+    except Exception:
+        return None
+    res = col.get(ids=[str(appid)])
+    if res and res["metadatas"] and res["metadatas"][0]:
+        return _to_result(str(appid), res["metadatas"][0])
+    return None

@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import type { Game } from '../types'
 import { importLibrary } from '../api'
-import { DEMO_GAMES } from '../demo'
 import SteamIdGuide from './SteamIdGuide'
 
 interface Props {
@@ -43,10 +42,6 @@ export default function LibraryPanel({ games, onLoaded }: Props) {
           ↻ 重新导入
         </button>
       )}
-
-      <button className="ghost" onClick={() => onLoaded(DEMO_GAMES)}>
-        或用示例库体验(断网可演示)
-      </button>
 
       {error && <div className="error">{error}</div>}
 
