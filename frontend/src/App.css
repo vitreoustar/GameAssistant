@@ -247,6 +247,72 @@
   background: #f0f7ff;
 }
 
+/* ---------- 弹窗 ---------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: #fff;
+  border-radius: 14px;
+  padding: 20px;
+  width: 420px;
+  max-width: 92vw;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+}
+
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.modal-head h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.close {
+  background: none;
+  border: none;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  color: #6b7280;
+}
+
+.guide {
+  margin: 12px 0 14px;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: #374151;
+}
+
+.modal a.primary.link {
+  display: block;
+  text-align: center;
+  text-decoration: none;
+  margin-bottom: 10px;
+  box-sizing: border-box;
+}
+
+.modal input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+}
+
 .error {
   color: #dc2626;
   font-size: 12px;

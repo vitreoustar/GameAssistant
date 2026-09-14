@@ -1,6 +1,6 @@
 # SteamAssistant 🎮
 
-AI 游戏助手 Agent —— 面试项目。
+AI 游戏助手 Agent
 
 读取你的 Steam 游戏库,整理已拥有游戏的 DLC 信息,并根据你的游戏库做定制化游戏推荐(基于 RAG 语义检索)。
 
@@ -96,14 +96,13 @@ uvicorn app.main:app --reload
 
 ```bash
 cd frontend
-npm install
 npm run dev
 # http://localhost:5173 (已配置 /api 代理到 8000)
 ```
 
 ## 功能说明
 
-- **游戏库导入** 三种模式:SteamID(需 key)/ 主页 URL(抓取,需公开)/ 粘贴游戏名列表
+- **游戏库导入**:SteamID(需 key)
 - **DLC 整理**:列出每款游戏的已拥有 / 未拥有 DLC 与价格,汇总补齐总价
 - **游戏推荐**:从你的库中提取类型画像 → 语义检索相似游戏 → LLM 生成个性化推荐 + 理由
 - **流式输出**:聊天中实时展示 agent 中间步骤(route/dlc/recommend)与 token 流
