@@ -1,0 +1,20 @@
+# Web 框架
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+pydantic
+
+# Agent / LLM
+langgraph
+langchain-core
+langchain-openai
+
+# RAG
+chromadb
+sentence-transformers
+
+# 数据处理
+pandas
+pyarrow
+beautifulsoup4

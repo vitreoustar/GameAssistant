@@ -1,0 +1,35 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# === Secrets (真实密钥只放本地 .env，绝不入库) ===
+.env
+.env.*
+!.env.example
+
+# === 数据 / 缓存 ===
+backend/data/
+*.chroma/
+*.sqlite3
+*.parquet
+*.csv
+.cache/
+*.log
+
+# === Node / 前端 ===
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# === IDE / OS ===
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
