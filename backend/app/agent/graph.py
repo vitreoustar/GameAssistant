@@ -361,10 +361,42 @@ async def game_ask_node(state: AgentState) -> dict:
     if not name:
         return {"messages": [AIMessage(content="你想问哪款游戏?把名字告诉我,比如「赛博朋克2077怎么样」")]}
 
-    appid = await _resolve_any_game(name)
-    if appid is None:
+    items = await _search_store(name)
+    if not items:
         return {"messages": [AIMessage(content=f"没找到《{name}》,换个名字试试?")]}
 
+    # 过滤出真正的游戏(排除 DLC/原声带/工具等)
+    game_items = await _filter_games(items[:5])
+    if not game_items:
+        return {"messages": [AIMessage(content=f"没找到《{name}》,换个名字试试?")]}
+
+    # 多个结果:列出 top 3 + 匹配度,询问是哪个
+    if len(game_items) > 1:
+        text = await _multi_result_text(name, game_items[:3], games)
+        return {"messages": [AIMessage(content=text)]}
+
+    return await _single_game_analysis(game_items[0]["id"], games)
+
+
+async def _filter_games(items: list[dict]) -> list[dict]:
+    """过滤商店搜索结果,只保留 type == game 的本体游戏。"""
+    result: list[dict] = []
+    for it in items:
+        d = await steam_client.get_app_details(it["id"])
+        if d and d.get("type") == "game":
+            result.append(it)
+    return result
+
+
+async def _search_store(name: str) -> list[dict]:
+    try:
+        lang = "schinese" if _has_cjk(name) else "english"
+        return await steam_client.search_store(name, lang=lang)
+    except Exception:
+        return []
+
+
+async def _single_game_analysis(appid: int, games: list[dict]) -> dict:
     details = await steam_client.get_app_details(appid)
     if not details:
         return {"messages": [AIMessage(content="没查到这款游戏的详细信息。")]}
@@ -413,16 +445,29 @@ async def game_ask_node(state: AgentState) -> dict:
     return {"game_analysis": analysis, "messages": [AIMessage(content=text)]}
 
 
-async def _resolve_any_game(name: str) -> int | None:
-    """解析任意游戏名(不限用户库) -> appid。"""
-    try:
-        lang = "schinese" if _has_cjk(name) else "english"
-        items = await steam_client.search_store(name, lang=lang)
-        if items:
-            return items[0]["id"]
-    except Exception:
-        pass
-    return None
+async def _multi_result_text(name: str, items: list[dict], games: list[dict]) -> str:
+    """多结果时,列出每个候选的类型/评价/与用户偏好的重叠,询问是哪个。"""
+    profile = (
+        await _build_profile(games)
+        if games
+        else {"top_genres": [], "top_categories": [], "summary": "暂无游戏库"}
+    )
+    top = set(profile.get("top_genres") or [])
+
+    lines = [f"搜到好几个和「{name}」相关的结果,你看看是哪个 👀"]
+    for i, it in enumerate(items, 1):
+        d = await steam_client.get_app_details(it["id"])
+        if not d:
+            continue
+        genres = ", ".join(g.get("description", "") for g in d.get("genres") or []) or "未知"
+        gset = {g.get("description", "") for g in d.get("genres") or []}
+        overlap = sorted(gset & top)
+        meta = rag_store.get_game(it["id"])
+        rating = meta["rating"] if meta else "评价较少"
+        match_s = f",与你偏好重叠:{'、'.join(overlap)}" if overlap else ",和你常玩类型交集不大"
+        lines.append(f"{i}. 《{d.get('name')}》—— 类型:{genres};评价:{rating}{match_s}")
+    lines.append("告诉我是第几个,或者给个更准确的名字~")
+    return "\n".join(lines)
 
 
 def _format_game_info(details: dict, meta: dict | None, match_genres: list[str], owned: bool) -> str:
