@@ -6,6 +6,7 @@ StateGraph 结构:
 from __future__ import annotations
 
 import json
+import re
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -35,6 +36,8 @@ class AgentState(TypedDict):
     profile: dict | None
     candidates: list[dict]
     game_analysis: dict | None
+    game_candidates: list[dict]
+    context_candidates: list[dict]
 
 
 def get_llm() -> ChatOpenAI:
@@ -95,6 +98,8 @@ def _keyword_route(message: str) -> str:
         if any(k in m for k in ("展开", "更多", "全部", "详细", "还有", "完整", "有哪些", "多少")):
             return "dlc_detail"
         return "dlc"
+    if re.search(r"第\s*[0-9一二三四五]+\s*[个款]", m):
+        return "game_ask"
     if any(k in m for k in ("怎么样", "好不好玩", "好玩吗", "值得买", "值得玩", "评价", "如何")):
         return "game_ask"
     if any(k in m for k in ("推荐", "recommend", "喜欢", "好玩", "类似")):
@@ -306,7 +311,7 @@ async def recommend_node(state: AgentState) -> dict:
     for q in _build_queries(profile, games):
         for r in rag_store.search(q, k=8, exclude=owned):
             candidates[r["appid"]] = r
-    cand_list = sorted(candidates.values(), key=lambda x: x["distance"])[:8]
+    cand_list = sorted(candidates.values(), key=lambda x: x["distance"])[:5]
 
     intro, reasons = await _generate_reasons(profile, cand_list)
     for c in cand_list:
@@ -357,6 +362,13 @@ async def game_ask_node(state: AgentState) -> dict:
     games = state.get("library") or []
     message = str(state["messages"][-1].content)
 
+    # 1) "第x个" 从上次推荐上下文解析
+    idx = _extract_ordinal(message)
+    ctx_cands = state.get("context_candidates") or []
+    if idx is not None and 0 < idx <= len(ctx_cands):
+        appid = ctx_cands[idx - 1]["appid"]
+        return await _single_game_analysis(appid, games)
+
     name = await _extract_game_name(message)
     if not name:
         return {"messages": [AIMessage(content="你想问哪款游戏?把名字告诉我,比如「赛博朋克2077怎么样」")]}
@@ -365,17 +377,29 @@ async def game_ask_node(state: AgentState) -> dict:
     if not items:
         return {"messages": [AIMessage(content=f"没找到《{name}》,换个名字试试?")]}
 
-    # 过滤出真正的游戏(排除 DLC/原声带/工具等)
-    game_items = await _filter_games(items[:5])
+    game_items = await _filter_games(items[:8])
     if not game_items:
         return {"messages": [AIMessage(content=f"没找到《{name}》,换个名字试试?")]}
 
-    # 多个结果:列出 top 3 + 匹配度,询问是哪个
     if len(game_items) > 1:
-        text = await _multi_result_text(name, game_items[:3], games)
-        return {"messages": [AIMessage(content=text)]}
+        text, cards = await _multi_result_cards(name, game_items[:5], games)
+        return {"game_candidates": cards, "messages": [AIMessage(content=text)]}
 
     return await _single_game_analysis(game_items[0]["id"], games)
+
+
+def _extract_ordinal(message: str) -> int | None:
+    """从消息里解析「第x个/第x款」中的序数。"""
+    m = re.search(r"第\s*([0-9一二三四五]+)\s*[个款]", message)
+    if not m:
+        return None
+    num = m.group(1)
+    cn = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+    if num in cn:
+        return cn[num]
+    if num.isdigit():
+        return int(num)
+    return None
 
 
 async def _filter_games(items: list[dict]) -> list[dict]:
@@ -415,7 +439,9 @@ async def _single_game_analysis(appid: int, games: list[dict]) -> dict:
     rating = meta["rating"] if meta else "评价较少"
     header = (details.get("header_image") or "") or (meta.get("header_image") if meta else "")
 
-    game_info = _format_game_info(details, meta, match_genres, owned)
+    reviews = await steam_client.get_app_reviews(appid, num=3)
+    game_info = _format_game_info(details, meta, match_genres, owned, reviews)
+
     text = "我先看看这款游戏~"
     try:
         text = await _llm_stream_text(
@@ -445,8 +471,10 @@ async def _single_game_analysis(appid: int, games: list[dict]) -> dict:
     return {"game_analysis": analysis, "messages": [AIMessage(content=text)]}
 
 
-async def _multi_result_text(name: str, items: list[dict], games: list[dict]) -> str:
-    """多结果时,列出每个候选的类型/评价/与用户偏好的重叠,询问是哪个。"""
+async def _multi_result_cards(
+    name: str, items: list[dict], games: list[dict]
+) -> tuple[str, list[dict]]:
+    """多结果时,返回说明文字 + 候选卡片列表(最多 5 个)。"""
     profile = (
         await _build_profile(games)
         if games
@@ -454,36 +482,61 @@ async def _multi_result_text(name: str, items: list[dict], games: list[dict]) ->
     )
     top = set(profile.get("top_genres") or [])
 
+    cards: list[dict] = []
     lines = [f"搜到好几个和「{name}」相关的结果,你看看是哪个 👀"]
     for i, it in enumerate(items, 1):
         d = await steam_client.get_app_details(it["id"])
         if not d:
             continue
+        meta = rag_store.get_game(it["id"])
+        rating = meta["rating"] if meta else "评价较少"
+        header = (d.get("header_image") or "") or (meta.get("header_image") if meta else "")
         genres = ", ".join(g.get("description", "") for g in d.get("genres") or []) or "未知"
         gset = {g.get("description", "") for g in d.get("genres") or []}
         overlap = sorted(gset & top)
-        meta = rag_store.get_game(it["id"])
-        rating = meta["rating"] if meta else "评价较少"
-        match_s = f",与你偏好重叠:{'、'.join(overlap)}" if overlap else ",和你常玩类型交集不大"
-        lines.append(f"{i}. 《{d.get('name')}》—— 类型:{genres};评价:{rating}{match_s}")
+        cards.append(
+            {
+                "appid": it["id"],
+                "name": d.get("name", ""),
+                "header_image": header,
+                "genres": genres,
+                "categories": ", ".join(c.get("description", "") for c in d.get("categories") or []),
+                "price_cents": (d.get("price_overview") or {}).get("final"),
+                "rating": rating,
+                "match_genres": overlap,
+            }
+        )
+        lines.append(f"{i}. 《{d.get('name')}》")
     lines.append("告诉我是第几个,或者给个更准确的名字~")
-    return "\n".join(lines)
+    return "\n".join(lines), cards
 
 
-def _format_game_info(details: dict, meta: dict | None, match_genres: list[str], owned: bool) -> str:
+def _format_game_info(
+    details: dict,
+    meta: dict | None,
+    match_genres: list[str],
+    owned: bool,
+    reviews: dict | None = None,
+) -> str:
     name = details.get("name", "")
     genres = ", ".join(g.get("description", "") for g in details.get("genres") or [])
     cats = ", ".join(c.get("description", "") for c in details.get("categories") or [])
     price = (details.get("price_overview") or {}).get("final")
     price_s = f"${price / 100:.2f}" if price is not None else "免费"
     rating = meta["rating"] if meta else "评价较少"
-    desc = (details.get("short_description") or "").strip()[:200]
+    desc = (details.get("short_description") or "").strip()[:300]
     lines = [f"游戏名:{name}", f"类型:{genres}", f"玩法/特性:{cats}", f"价格:{price_s}", f"评价:{rating}"]
     if desc:
         lines.append(f"简介:{desc}")
     lines.append(f"用户是否已拥有:{'是' if owned else '否'}")
     if match_genres:
         lines.append(f"与用户偏好重叠的类型:{'、'.join(match_genres)}")
+    if reviews:
+        for r in reviews.get("reviews", [])[:2]:
+            vote = "👍" if r.get("voted_up") else "👎"
+            rv = (r.get("review") or "").strip().replace("\n", " ")
+            if rv:
+                lines.append(f"玩家评价({vote}):{rv[:150]}")
     return "\n".join(lines)
 
 

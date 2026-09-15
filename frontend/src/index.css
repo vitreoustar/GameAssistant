@@ -1,9 +1,15 @@
 :root {
-  --text: #1f2937;
-  --text-muted: #9ca3af;
-  --bg: #ffffff;
-  --border: #e5e7eb;
-  --accent: #1f6feb;
+  --bg: #1b2838;
+  --bg-panel: #16202d;
+  --bg-card: #1e2c3a;
+  --border: #2a3f52;
+  --text: #c7d5e0;
+  --text-muted: #8f98a0;
+  --accent: #66c0f4;
+  --accent-hover: #8ad0f7;
+  --good: #a3cf6d;
+  --mixed: #d7a04b;
+  --bad: #d9534f;
 
   font-family: system-ui, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   line-height: 1.5;
@@ -18,11 +24,18 @@
 }
 
 html,
-body,
-#root {
+body {
   margin: 0;
   padding: 0;
-  min-height: 100vh;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* UI 整体放大到 120%(同时保证整页不出现纵向滚动条) */
+#root {
+  zoom: 1.2;
+  height: calc(100vh / 1.2);
+  overflow: hidden;
 }
 
 body {

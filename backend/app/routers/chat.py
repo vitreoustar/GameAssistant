@@ -15,9 +15,14 @@ from app.schemas import Game
 router = APIRouter()
 
 
+class ChatContext(BaseModel):
+    candidates: list[Game] | None = None  # 上次推荐候选,用于解析「第x个」
+
+
 class ChatRequest(BaseModel):
     message: str
     library: list[Game] | None = None
+    context: ChatContext | None = None
 
 
 @router.post("/chat")
@@ -26,10 +31,13 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         raise HTTPException(status_code=400, detail="消息不能为空")
 
     library = [g.model_dump() for g in (req.library or [])]
+    context_candidates = (
+        [g.model_dump() for g in (req.context.candidates or [])] if req.context else []
+    )
 
     async def event_stream():
         try:
-            async for ev in stream_agent(req.message, library):
+            async for ev in stream_agent(req.message, library, context_candidates):
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         except Exception as exc:  # 兜底:把错误也作为事件返回,前端可显示
             err = {"type": "error", "data": str(exc)}

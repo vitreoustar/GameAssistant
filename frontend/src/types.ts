@@ -32,6 +32,12 @@ export interface DlcReport {
   rows: DlcRow[]
 }
 
+export interface Profile {
+  top_genres: string[]
+  top_categories: string[]
+  summary: string
+}
+
 export interface Candidate {
   appid: number
   name: string
@@ -45,12 +51,6 @@ export interface Candidate {
   metacritic_score: number
   distance: number
   reason?: string
-}
-
-export interface Profile {
-  top_genres: string[]
-  top_categories: string[]
-  summary: string
 }
 
 export interface GameAnalysis {
@@ -68,9 +68,24 @@ export interface GameAnalysis {
   owned: boolean
 }
 
+// 对话内统一的卡片结构
+export interface GameCard {
+  appid: number
+  name: string
+  header_image: string
+  genres: string
+  price_cents: number | null
+  rating: string
+  reason?: string
+  match_genres?: string[]
+  owned?: boolean
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  cards?: GameCard[]
+  cardPosition?: 'before' | 'after'
 }
 
 export interface Step {
@@ -90,6 +105,7 @@ export type StreamEvent =
         profile: Profile | null
         candidates: Candidate[] | null
         game_analysis: GameAnalysis | null
+        game_candidates: GameCard[] | null
       }
     }
   | { type: 'error'; data: string }

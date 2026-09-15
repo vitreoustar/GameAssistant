@@ -18,10 +18,15 @@ NODE_NAMES = {"route", "dlc", "dlc_detail", "recommend", "game_ask", "chat"}
 STREAM_NODES = {"dlc", "recommend", "game_ask", "chat"}
 
 
-async def stream_agent(message: str, library: list[dict]) -> AsyncIterator[dict]:
+async def stream_agent(
+    message: str,
+    library: list[dict],
+    context_candidates: list[dict] | None = None,
+) -> AsyncIterator[dict]:
     input_payload = {
         "messages": [HumanMessage(content=message)],
         "library": library or [],
+        "context_candidates": context_candidates or [],
     }
     final_state: dict | None = None
 
@@ -58,5 +63,6 @@ async def stream_agent(message: str, library: list[dict]) -> AsyncIterator[dict]
             "profile": final_state.get("profile"),
             "candidates": final_state.get("candidates"),
             "game_analysis": final_state.get("game_analysis"),
+            "game_candidates": final_state.get("game_candidates"),
         },
     }

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { ChatMessage, Step } from '../types'
+import GameCardView from './GameCard'
 
 interface Props {
   messages: ChatMessage[]
@@ -24,12 +25,26 @@ export default function ChatPanel({ messages, steps, streaming, onSend }: Props)
       <div className="messages">
         {messages.length === 0 && (
           <div className="empty">
-            先连接右侧游戏库,然后问我「整理我的 DLC」或「推荐几款我喜欢的游戏」
+            先连接右侧游戏库,然后问我「推荐几款游戏」或「某游戏怎么样」
           </div>
         )}
         {messages.map((m, i) => (
           <div key={i} className={`msg ${m.role}`}>
-            <div className="bubble">{m.content}</div>
+            {m.cards && m.cardPosition === 'before' && (
+              <div className="msg-cards">
+                {m.cards.map((c) => (
+                  <GameCardView key={c.appid} card={c} />
+                ))}
+              </div>
+            )}
+            {m.content && <div className="bubble">{m.content}</div>}
+            {m.cards && m.cardPosition === 'after' && (
+              <div className="msg-cards">
+                {m.cards.map((c) => (
+                  <GameCardView key={c.appid} card={c} />
+                ))}
+              </div>
+            )}
           </div>
         ))}
         {streaming && active.length > 0 && (

@@ -108,6 +108,5 @@ npm run dev
 
 ## 注意事项
 
-- ⚠️ `.env` 已 gitignore,**不要**把真实 key 提交到仓库;计划文件/README 中不含任何密钥
 - `backend/data/`(语料与向量库)已 gitignore,clone 后需重新 `build_corpus.py` + `build_index.py`
 - 首次「推荐游戏」请求会加载本地 embedding 模型(约 10~20s),之后走缓存很快

@@ -23,6 +23,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 WEB_API = "https://api.steampowered.com"
+STORE_BASE = "https://store.steampowered.com"
 STORE_API = "https://store.steampowered.com/api"
 COMMUNITY = "https://steamcommunity.com"
 
@@ -177,6 +178,25 @@ class SteamClient:
 
         pairs = await asyncio.gather(*(one(a) for a in appids))
         return dict(pairs)
+
+    async def get_app_reviews(
+        self, appid: int, num: int = 3, lang: str = "schinese"
+    ) -> dict:
+        """Steam 用户评价(免费,无需 key)。"""
+        data = await self._get_json(
+            f"{STORE_BASE}/appreviews/{appid}",
+            {
+                "json": 1,
+                "language": lang,
+                "purchase_type": "all",
+                "num_per_page": num,
+                "filter": "summary",
+            },
+        )
+        return {
+            "summary": (data or {}).get("query_summary") or {},
+            "reviews": (data or {}).get("reviews") or [],
+        }
 
     # ---------- Steam Community 抓取 ----------
 
