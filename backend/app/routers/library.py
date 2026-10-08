@@ -1,7 +1,7 @@
-"""游戏库相关端点。支持三种导入模式:
-  1. steamid64 + Steamworks key -> GetOwnedGames
-  2. 个人主页 URL -> 抓取 games 页
-  3. 粘贴游戏名列表 -> 名称匹配 appid
+"""游戏库导入端点。
+
+POST /api/library  body: {"mode": "steamid", "value": "<steamid64>"}
+需要 STEAM_API_KEY,且该用户「游戏详情」隐私设为公开。
 """
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel

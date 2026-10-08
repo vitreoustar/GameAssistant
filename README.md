@@ -10,7 +10,7 @@ AI 游戏助手 Agent
 |---|---|
 | 前端 | React + Vite + TypeScript |
 | 后端 | FastAPI |
-| Agent | LangGraph(意图路由 → DLC / 推荐 / 闲聊) |
+| Agent | LangGraph(意图路由 → DLC / 推荐 / 游戏评测 / 闲聊) |
 | RAG | ChromaDB + sentence-transformers(本地 embedding) |
 | LLM | DeepSeek(`deepseek-flash`) |
 
@@ -34,18 +34,22 @@ flowchart LR
 ```
 SteamAssistant/
 ├─ frontend/          # React + Vite
-│  └─ src/components/ # Chat / Library / Dlc / Recommend
+│  └─ src/components/ # Chat / Library / Dlc / Card
 ├─ backend/
 │  ├─ app/
 │  │  ├─ main.py      # FastAPI 入口 + CORS
-│  │  ├─ routers/     # library / dlc / recommend / chat(SSE)
+│  │  ├─ routers/     # library / dlc / chat(SSE)
 │  │  ├─ agent/       # LangGraph 图、提示词、流式
 │  │  ├─ rag/         # embedder + ChromaDB 检索
 │  │  └─ steam/       # API 客户端、导入、DLC 计算
 │  ├─ scripts/        # build_corpus.py / build_index.py
+│  ├─ tests/          # 离线单测 + 手工联调脚本
 │  ├─ data/           # 语料 + 向量库(已 gitignore,需本地构建)
 │  └─ .env.example
-└─ PLAN.md
+├─ docs/
+│  ├─ PROJECT.md      # 现状:架构、模块详解、API、踩坑
+│  └─ ROADMAP.md      # 深化路线图:清理清单、Phase 0、方向 A/B
+└─ README.md
 ```
 
 ## 快速开始
@@ -74,6 +78,7 @@ DEEPSEEK_API_KEY=sk-xxxx
 STEAM_API_KEY=xxxx
 STEAM_ID=7656119xxxxxxxxxx            # 可选
 STEAM_PROXY=http://127.0.0.1:12450    # 国内访问 Steam 的本地代理,无则留空
+STEAM_RATE_LIMIT=10                   # Steam 请求限速(每秒请求数)
 HF_ENDPOINT=https://hf-mirror.com     # 国内下载模型/数据集镜像
 ```
 
@@ -102,11 +107,17 @@ npm run dev
 ## 功能说明
 
 - **游戏库导入**:SteamID 导入(需 key + 资料公开),内置获取 SteamID 引导弹窗
-- **DLC 整理**:列出每款游戏的已拥有 / 未拥有 DLC 与价格,汇总补齐总价
-- **游戏推荐**:从你的库中提取类型画像 → 语义检索相似游戏 → LLM 生成个性化推荐 + 理由
-- **流式输出**:聊天中实时展示 agent 中间步骤(route/dlc/recommend)与 token 流
+- **DLC 整理**:列出每款游戏的已拥有 / 未拥有 DLC 与价格;追问可展开某游戏的完整列表
+- **游戏推荐**:从你的库中提取类型画像 → 语义检索相似游戏 → LLM 生成个性化推荐 + 理由,卡片内联展示(最多 5 个)
+- **游戏评测**:问「某游戏怎么样」→ 卡片 + 详细介绍(引用真实玩家评价)+ 与你的偏好匹配分析
+- **流式输出**:聊天中实时展示 agent 中间步骤与 token 流
 
 ## 注意事项
 
 - `backend/data/`(语料与向量库)已 gitignore,clone 后需重新 `build_corpus.py` + `build_index.py`
 - 首次「推荐游戏」请求会加载本地 embedding 模型(约 10~20s),之后走缓存很快
+
+## 文档与路线图
+
+- 现状文档见 [docs/PROJECT.md](docs/PROJECT.md)(架构、模块详解、API、踩坑)
+- 深化计划见 [docs/ROADMAP.md](docs/ROADMAP.md):已确认**以「本地 LLM 推理服务 + 调优」(AI Infra)为主干**,并配一个"离线预计算召回"的推荐算法切片

@@ -264,9 +264,25 @@ def _summarize_dlc_detail(report: dict) -> str:
 
 # ---------- 用户画像 & 推荐 ----------
 
+PROFILE_SAMPLE_SIZE = 30  # 画像取样的游戏数
+
+
+def _top_games_by_playtime(games: list[dict], n: int | None = None) -> list[dict]:
+    """按游玩时长降序取前 n 款(playtime 缺失视为 0,排在最后)。"""
+    ordered = sorted(
+        games, key=lambda g: g.get("playtime_forever") or 0, reverse=True
+    )
+    return ordered[:n] if n else ordered
+
+
 async def _build_profile(games: list[dict]) -> dict:
-    """从用户库统计类型/玩法偏好,生成画像。"""
-    ids = [g["appid"] for g in games[:30]]
+    """从用户库统计类型/玩法偏好,生成画像。
+
+    注意:取样必须按游玩时长取 Top N。`library` 的顺序由 Steam 决定
+    (GetOwnedGames 近似按 appid 返回),直接 `games[:30]` 会拿到与偏好无关的
+    随机 30 款,画像也就失去意义。
+    """
+    ids = [g["appid"] for g in _top_games_by_playtime(games, PROFILE_SAMPLE_SIZE)]
     details = await steam_client.get_many_app_details(ids)
 
     genre_counter: dict[str, int] = {}
@@ -293,8 +309,7 @@ def _build_queries(profile: dict, games: list[dict]) -> list[str]:
     queries: list[str] = []
     if profile.get("top_genres"):
         queries.append(f"Games in genres: {', '.join(profile['top_genres'][:3])}")
-    by_play = sorted(games, key=lambda x: x.get("playtime_forever") or 0, reverse=True)
-    for g in by_play[:3]:
+    for g in _top_games_by_playtime(games, 3):
         queries.append(f"Games similar to {g['name']}")
     return queries[:4]
 
@@ -365,9 +380,21 @@ async def game_ask_node(state: AgentState) -> dict:
     # 1) "第x个" 从上次推荐上下文解析
     idx = _extract_ordinal(message)
     ctx_cands = state.get("context_candidates") or []
-    if idx is not None and 0 < idx <= len(ctx_cands):
-        appid = ctx_cands[idx - 1]["appid"]
-        return await _single_game_analysis(appid, games)
+    if idx is not None:
+        if 0 < idx <= len(ctx_cands):
+            return await _single_game_analysis(ctx_cands[idx - 1]["appid"], games)
+        # 有「第x个」但没有可用候选:不能继续往下抽游戏名,
+        # 否则「第2个」会被当成游戏名去搜商店,返回毫无意义的结果。
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        f"我这边没有第 {idx} 个候选游戏~ "
+                        "先让我给你推荐几款,再说「第几个」我就知道啦。"
+                    )
+                )
+            ]
+        }
 
     name = await _extract_game_name(message)
     if not name:

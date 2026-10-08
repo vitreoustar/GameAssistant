@@ -15,6 +15,8 @@ dist/
 
 # === 数据 / 缓存 ===
 backend/data/
+# 推荐算法用的公开交互数据集(约 120MB,CC-BY-4.0,本地下载)
+Steam_November2025_Dataset/
 *.chroma/
 *.sqlite3
 *.parquet

@@ -1,7 +1,7 @@
 """DLC 整理端点。
 
 POST /api/dlc
-  可传 games 列表(推荐,先经 /api/library 解析),或传 mode+value 直接解析。
+  推荐传 games 列表(先经 /api/library 解析),也可传 mode=steamid + steamid64 直接解析。
 """
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel

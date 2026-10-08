@@ -29,6 +29,10 @@ class Settings:
     steam_proxy: str = os.getenv("STEAM_PROXY", "")
     steam_verify_ssl: bool = os.getenv("STEAM_VERIFY_SSL", "1") != "0"
 
+    # Steam 请求限速(全局令牌桶):rate = 每秒请求数,burst = 允许的突发令牌数
+    steam_rate_limit: float = float(os.getenv("STEAM_RATE_LIMIT", "10"))
+    steam_rate_burst: int = int(os.getenv("STEAM_RATE_BURST", "5"))
+
     # Embedding（本地 sentence-transformers）
     embedding_model: str = os.getenv(
         "EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"

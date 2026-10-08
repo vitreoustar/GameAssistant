@@ -1,20 +1,21 @@
+# 依赖下限按开发环境实测版本给出(Windows / Python 3.13),
+# 升级前请先跑 `python -m unittest discover -s tests` 验证。
+
 # Web 框架
-fastapi
-uvicorn[standard]
-httpx
-python-dotenv
-pydantic
+fastapi>=0.141
+uvicorn[standard]>=0.53
+httpx>=0.28
+python-dotenv>=1.2
+pydantic>=2.13
 
 # Agent / LLM
-langgraph
-langchain-core
-langchain-openai
+langgraph>=1.2
+langchain-core>=1.6
+langchain-openai>=1.6
 
-# RAG
-chromadb
-sentence-transformers
+# RAG（本地 embedding，无需额外 key）
+chromadb>=1.5
+sentence-transformers>=6.0
 
-# 数据处理
-pandas
-pyarrow
-beautifulsoup4
+# 数据处理（仅 scripts/build_corpus.py 读取 parquet 时用）
+pyarrow>=25.0
