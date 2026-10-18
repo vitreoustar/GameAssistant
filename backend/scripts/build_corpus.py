@@ -24,12 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pyarrow.parquet as pq
 
+from app.recommend.features import DESC_LIMIT, build_item_text  # noqa: E402
+
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PARQUET_PATH = DATA_DIR / "steam_games.parquet"
 OUTPUT_PATH = DATA_DIR / "corpus.jsonl"
 
 MIN_OWNERS = 200_000  # estimated_owners 下界
-DESC_LIMIT = 800      # 描述截断长度
 
 DATASET_PATH = "datasets/FronkonGames/steam-games-dataset/resolve/main/data/train-00000-of-00001.parquet"
 
@@ -54,14 +55,11 @@ def parse_owners(value: str | None) -> int:
 
 
 def build_text(name: str, genres: list[str], categories: list[str], desc: str) -> str:
-    parts = [name]
-    if genres:
-        parts.append(f"Genres: {', '.join(genres)}")
-    if categories:
-        parts.append(f"Categories: {', '.join(categories)}")
-    if desc:
-        parts.append(desc[:DESC_LIMIT])
-    return "\n".join(parts)
+    """物品文本模板 —— 唯一实现在 app.recommend.features,此处仅做列表->字符串转换。
+
+    A2 的内容向量必须和这里喂给 ChromaDB 的文本逐字节一致,所以两边共用同一个函数。
+    """
+    return build_item_text(name, ", ".join(genres or []), ", ".join(categories or []), desc)
 
 
 def main() -> None:

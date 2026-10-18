@@ -17,5 +17,12 @@ langchain-openai>=1.6
 chromadb>=1.5
 sentence-transformers>=6.0
 
-# 数据处理（仅 scripts/build_corpus.py 读取 parquet 时用）
+# 数据处理 / 推荐算法
+#   pyarrow  —— scripts/build_corpus.py 读 parquet
+#   pandas / numpy —— 方向 A 数据管线(A1.2 落盘、A2 预计算矩阵、A4 特征工程)
+#   lightgbm —— A4 的 LTR 排序层(lambdarank)
+#   注:pandas 在 P0.1 清理时曾因"全项目未使用"被移除,方向 A 开工后重新需要
 pyarrow>=25.0
+pandas>=2.2
+numpy>=1.26
+lightgbm>=4.7

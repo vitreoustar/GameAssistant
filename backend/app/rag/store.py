@@ -8,6 +8,7 @@ import chromadb
 from chromadb.config import Settings as ChromaSettings
 
 from app.rag.embedder import embed_documents, embed_query
+from app.recommend.features import rating_text  # noqa: F401  再导出,保持 rag.store.rating_text 可用
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 COLLECTION = "steam_games"
@@ -23,25 +24,6 @@ def get_client() -> chromadb.ClientAPI:
             settings=ChromaSettings(anonymized_telemetry=False),
         )
     return _client
-
-
-def rating_text(positive: int, negative: int) -> str:
-    """Steam 好评率 -> 中文评价标签。"""
-    total = (positive or 0) + (negative or 0)
-    if total < 50:
-        return "评价较少"
-    pct = (positive or 0) / total * 100
-    if pct >= 95:
-        return "好评如潮"
-    if pct >= 80:
-        return "特别好评"
-    if pct >= 70:
-        return "多半好评"
-    if pct >= 40:
-        return "褒贬不一"
-    if pct >= 20:
-        return "多半差评"
-    return "差评如潮"
 
 
 def _scalar_metadata(doc: dict) -> dict:

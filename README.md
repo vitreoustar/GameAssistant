@@ -108,16 +108,36 @@ npm run dev
 
 - **游戏库导入**:SteamID 导入(需 key + 资料公开),内置获取 SteamID 引导弹窗
 - **DLC 整理**:列出每款游戏的已拥有 / 未拥有 DLC 与价格;追问可展开某游戏的完整列表
-- **游戏推荐**:从你的库中提取类型画像 → 语义检索相似游戏 → LLM 生成个性化推荐 + 理由,卡片内联展示(最多 5 个)
+- **游戏推荐**:本地**混合推荐**(5 路召回 + LightGBM 精排)→ LLM 生成个性化理由,卡片内联展示(最多 5 个)。
+  在线纯查表 + 点积,**不跑 embedding 推理、不调 Steam**,实测 P50 7ms
 - **游戏评测**:问「某游戏怎么样」→ 卡片 + 详细介绍(引用真实玩家评价)+ 与你的偏好匹配分析
 - **流式输出**:聊天中实时展示 agent 中间步骤与 token 流
 
+### 推荐算法(方向 A)
+
+| 指标 | 改造前(多查询 RAG) | 改造后(混合召回 + LTR) |
+|---|---|---|
+| recall@10 | 0.80% | **24.00%** |
+| NDCG@10 | 0.0031 | **0.1430** |
+| 在线延迟 P50 | 需跑一次 embedding 推理 | **7.4 ms** |
+| 是否需 GPU | 否(CPU 跑 embedding) | 否(零推理) |
+
+离线资产(73 MB,`backend/data/recommend/`):11,444 物品目录 + 内容向量 + 两路 TopK 邻居
++ 用户画像向量 + 交互稀疏矩阵 + LightGBM 排序模型。完整的消融、协议设计与踩坑记录见
+[docs/ROADMAP.md](docs/ROADMAP.md) §3。
+
 ## 注意事项
 
-- `backend/data/`(语料与向量库)已 gitignore,clone 后需重新 `build_corpus.py` + `build_index.py`
-- 首次「推荐游戏」请求会加载本地 embedding 模型(约 10~20s),之后走缓存很快
+- `backend/data/`(语料、向量库、推荐索引)已 gitignore,clone 后需重新构建:
+  `build_corpus.py` → `build_index.py` → `build_interactions.py` → `build_recommend_index.py` → `train_ranker.py`
+- 本地推荐索引冷加载约 0.9s,应用启动时已预热(`lifespan`);
+  **索引缺失时推荐节点会自动退回原来的 RAG 路径**,服务不会起不来
+- 首次「推荐游戏」请求若走 RAG 降级路径,会加载本地 embedding 模型(约 10~20s)
 
 ## 文档与路线图
 
 - 现状文档见 [docs/PROJECT.md](docs/PROJECT.md)(架构、模块详解、API、踩坑)
-- 深化计划见 [docs/ROADMAP.md](docs/ROADMAP.md):已确认**以「本地 LLM 推理服务 + 调优」(AI Infra)为主干**,并配一个"离线预计算召回"的推荐算法切片
+- **推荐算法实现全记录见 [docs/RECOMMENDER.md](docs/RECOMMENDER.md)**(数据 / 离线索引 / 评测协议 /
+  召回 / LTR 排序 / 在线服务 / 消融 / **已知局限与 18 条可优化点**)
+- 深化计划见 [docs/ROADMAP.md](docs/ROADMAP.md):方向 A(推荐算法)已 ✅ 完成;
+  下一步是方向 B —— 以「本地 LLM 推理服务 + 调优」(AI Infra)为主干

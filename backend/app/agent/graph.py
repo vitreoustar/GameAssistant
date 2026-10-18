@@ -314,11 +314,81 @@ def _build_queries(profile: dict, games: list[dict]) -> list[str]:
     return queries[:4]
 
 
+def _local_recommender():
+    """取本地推荐器(A2~A4 的离线资产);不可用时返回 None,由调用方降级。"""
+    try:
+        from app.recommend import service as recommend_service
+
+        return recommend_service.get_recommender()
+    except Exception:  # 依赖缺失/索引损坏都不该让整个 Agent 挂掉
+        return None
+
+
+async def _profile_for(games: list[dict]) -> dict:
+    """优先用本地目录算画像(零网络请求),不可用再退回 Steam appdetails。
+
+    这一改动的实际收益:原来每次推荐/评测都要打 30 次 `appdetails`,
+    现在直接从离线目录读类型与玩法,画像还更稳定(不受 Steam 限流影响)。
+    """
+    recommender = _local_recommender()
+    if recommender is not None:
+        rows = recommender.index.rows_of([int(g["appid"]) for g in games])
+        keep = rows >= 0
+        if keep.any():
+            import numpy as np
+
+            weights = np.array(
+                [float(g.get("playtime_forever") or 0.0) for g in games],
+                dtype=np.float32,
+            )[keep]
+            return recommender.build_profile(rows[keep], weights)
+    return await _build_profile(games)
+
+
 async def recommend_node(state: AgentState) -> dict:
+    """推荐节点:本地混合召回 + LTR 精排,LLM 只负责写开场白与理由。
+
+    与改造前的区别(见 docs/ROADMAP.md §A6):
+      * 召回不再跑 embedding 推理,也不再打 Steam —— 纯查表 + 点积
+      * 在线延迟 P50 7.4ms / P99 8.4ms(常规库大小)
+      * 候选质量:recall@10 从 0.80% 提到 24.00%
+    本地索引不可用时自动退回原来的 RAG 路径,保证最差仍可用。
+    """
     games = state.get("library") or []
     if not games:
         return {"messages": [AIMessage(content="先连接你的游戏库,我才能推荐哦~")]}
 
+    recommender = _local_recommender()
+    if recommender is None:
+        return await _recommend_via_rag(games)
+
+    result = recommender.recommend(games, top_k=5)
+    profile = result.profile
+    cand_list = [r.as_dict() for r in result.recommendations]
+    if not cand_list:
+        if result.cold_start:
+            text = "你的库里还没有我能识别的游戏。换个 SteamID 试试,或者告诉我你喜欢什么类型?"
+        else:
+            text = "你的游戏库已经覆盖了我语料里所有相关的游戏,暂时没有新的可以推荐了 🎉"
+        return {"profile": profile, "messages": [AIMessage(content=text)]}
+
+    intro, reasons = await _generate_reasons(profile, cand_list)
+    for c in cand_list:
+        c["reason"] = reasons.get(c["appid"]) or _fallback_reason(c, profile)
+
+    if intro:
+        text = intro
+    else:
+        text = _fallback_recommend(cand_list)
+        if result.cold_start:
+            text = "你的库里暂时没有我能分析的常玩游戏,先按口碑和热度挑几款 🎮\n" + text
+        elif result.unmatched_in_library:
+            text += f"(有 {result.unmatched_in_library} 款游戏不在我的语料里,这次没纳入分析)"
+    return {"profile": profile, "candidates": cand_list, "messages": [AIMessage(content=text)]}
+
+
+async def _recommend_via_rag(games: list[dict]) -> dict:
+    """降级路径:原来的多查询 RAG 召回(本地推荐索引不可用时使用)。"""
     profile = await _build_profile(games)
     owned = {g["appid"] for g in games}
 
@@ -337,10 +407,23 @@ async def recommend_node(state: AgentState) -> dict:
 
 
 async def _generate_reasons(profile: dict, candidates: list[dict]) -> tuple[str, dict[int, str]]:
-    """LLM 生成开场白 + 每款候选的推荐理由(JSON)。"""
+    """LLM 生成开场白 + 每款候选的推荐理由(JSON)。
+
+    候选行里带上本地召回器给出的证据(`because_of` / `match_genres`),
+    让理由能落到"因为你玩了《X》"这种具体依据上,而不是泛泛而谈。
+    """
     if not settings.deepseek_api_key:
         return "", {}
-    lines = [f"- {c['appid']} | {c['name']} | {c['genres']}" for c in candidates]
+    lines: list[str] = []
+    for c in candidates:
+        parts = [f"- {c['appid']} | {c['name']} | {c['genres']}"]
+        if c.get("match_genres"):
+            parts.append(f"与用户偏好重叠:{'、'.join(c['match_genres'])}")
+        if c.get("because_of"):
+            parts.append(f"用户在玩《{c['because_of']}》")
+        if c.get("channels"):
+            parts.append(f"召回来源:{'/'.join(c['channels'])}")
+        lines.append(" | ".join(parts))
     human = f"用户偏好:\n{profile['summary']}\n\n候选游戏:\n" + "\n".join(lines)
     try:
         llm = get_llm().bind(response_format={"type": "json_object"})
@@ -359,9 +442,21 @@ async def _generate_reasons(profile: dict, candidates: list[dict]) -> tuple[str,
 
 
 def _fallback_reason(candidate: dict, profile: dict) -> str:
-    genres = candidate.get("genres", "")
-    top = "、".join(profile.get("top_genres", [])[:2]) or "你的偏好"
-    return f"类型「{genres}」和 {top} 相近。"
+    """LLM 不可用时的确定性理由。
+
+    优先用本地召回器给出的证据(`because_of` / `match_genres`),它们比"类型相近"
+    具体得多;只有在都没有时才退回泛泛的类型对比。
+    """
+    parts: list[str] = []
+    if candidate.get("because_of"):
+        parts.append(f"你在玩《{candidate['because_of']}》,这款和它路子很像")
+    if candidate.get("match_genres"):
+        parts.append(f"类型上有{'、'.join(candidate['match_genres'][:2])}和你口味重合")
+    if not parts:
+        genres = candidate.get("genres", "")
+        top = "、".join(profile.get("top_genres", [])[:2]) or "你的偏好"
+        parts.append(f"类型「{genres}」和 {top} 相近")
+    return "，".join(parts) + "。"
 
 
 def _fallback_recommend(candidates: list[dict]) -> str:

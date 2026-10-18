@@ -27,8 +27,9 @@ SteamAssistant 是一个面向游戏玩家的 AI 助手 Agent:
 | Agent | LangGraph + langchain-openai |
 | LLM | DeepSeek `deepseek-flash`(OpenAI 兼容) |
 | RAG | ChromaDB + sentence-transformers `paraphrase-multilingual-MiniLM-L12-v2` |
-| 数据处理 | pyarrow(仅建库脚本用) |
+| 数据处理 | pyarrow(建库脚本)+ pandas / numpy(推荐算法数据管线) |
 | 语料 | FronkonGames/steam-games-dataset(parquet),过滤后 5362 条 |
+| 推荐数据 | 《Steam_November2025_Dataset》(CC-BY-4.0),去重后 840,274 交互 / 7,731 用户 / 9,935 物品 |
 
 ---
 
@@ -83,12 +84,13 @@ SteamAssistant/
 │        └─ DlcPanel.tsx      # DLC 报告表
 ├─ backend/
 │  ├─ app/
-│  │  ├─ main.py              # FastAPI 入口 + CORS + /healthz
+│  │  ├─ main.py              # FastAPI 入口 + CORS + /healthz + 推荐索引预热(lifespan)
 │  │  ├─ config.py            # Settings(读 .env)、HF_ENDPOINT 导出
 │  │  ├─ schemas.py           # Game 等 Pydantic 模型
 │  │  ├─ routers/
 │  │  │  ├─ library.py        # POST /api/library
 │  │  │  ├─ dlc.py            # POST /api/dlc
+│  │  │  ├─ recommend.py      # POST /api/recommend(本地推荐器,不调 LLM,~7ms)
 │  │  │  └─ chat.py           # POST /api/chat(SSE 流式)
 │  │  ├─ agent/
 │  │  │  ├─ graph.py          # ★ LangGraph 图、各节点、画像、推荐、评测
@@ -98,6 +100,13 @@ SteamAssistant/
 │  │  ├─ rag/
 │  │  │  ├─ embedder.py       # 本地 embedding 加载(注意 import 顺序!)
 │  │  │  └─ store.py          # ★ ChromaDB 建库/检索/按 id 查/评级
+│  │  ├─ recommend/           # ★ 方向 A:混合推荐算法(见 ROADMAP.md §3)
+│  │  │  ├─ features.py       # 纯函数:评价标签/好评率/销量下界/年份/时长分档
+│  │  │  ├─ index.py          # ★ A2 产物加载(mmap)+ 数组助手
+│  │  │  ├─ recall.py         # ★ A3 五路召回 + 配额轮转融合
+│  │  │  ├─ rank.py           # ★ A4 特征构造(训练/线上共用)+ 排序器
+│  │  │  ├─ evaluate.py       # 留一切分 + 排序指标 + 两套评测协议
+│  │  │  └─ service.py        # ★ A5 对外门面 + 懒加载单例
 │  │  └─ steam/
 │  │     ├─ client.py         # ★ SteamClient(缓存/令牌桶限速/并发/搜索/评价)
 │  │     ├─ dlc.py            # DLC 计算(拥有状态求交、上限、截断)
@@ -105,14 +114,23 @@ SteamAssistant/
 │  │     └─ __init__.py       # 共享 client 单例
 │  ├─ scripts/
 │  │  ├─ build_corpus.py      # 下载 parquet → 清洗 → corpus.jsonl
-│  │  └─ build_index.py       # corpus.jsonl → 嵌入 → ChromaDB
+│  │  ├─ build_index.py       # corpus.jsonl → 嵌入 → ChromaDB
+│  │  ├─ build_interactions.py  # 交互数据集 + corpus → 推荐算法用表(A1.2)
+│  │  ├─ build_recommend_index.py # → content_emb / 两路 TopK / 用户向量(A2)
+│  │  ├─ train_ranker.py      # LightGBM lambdarank 训练 + 评测(A4)
+│  │  ├─ eval_recall.py       # 两套协议的召回评测 + 嵌入配置对比(A3.1/A6)
+│  │  ├─ eval_recall_channels.py # 单通道消融 / 边际贡献 / 配额扫描(A3.2)
+│  │  ├─ eval_rag_baseline.py # 现有 RAG 方案对照(A6)
+│  │  └─ eval_embedding_config.py # 嵌入配置端到端裁决(A6)
 │  ├─ tests/                  # 离线单测(unittest)+ 手工联调脚本
-│  ├─ data/                   # gitignored:parquet/corpus.jsonl/chroma
+│  ├─ data/                   # gitignored:parquet/corpus/chroma/interactions/recommend
 │  ├─ requirements.txt
 │  └─ .env / .env.example
 ├─ docs/
-│  ├─ PROJECT.md              # 本文档(现状)
-│  └─ ROADMAP.md              # ★ 深化路线图(待办与方向选型)
+│  ├─ PROJECT.md              # 本文档(现状:架构、模块、API、踩坑)
+│  ├─ ROADMAP.md              # 深化路线图(方向选型、Phase 0、方向 B 计划)
+│  └─ RECOMMENDER.md          # ★ 推荐算法(方向 A)实现全记录 + 可优化点
+├─ Steam_November2025_Dataset/ # gitignored:公开交互数据集(A1.1)
 ├─ notes/                     # gitignored:面试相关(INTERVIEW/RESUME/知识点详解)
 └─ README.md
 ```
@@ -159,6 +177,10 @@ EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
 ```bash
 python scripts/build_corpus.py   # 下载数据集(192MB)→ data/corpus.jsonl(5362 条)
 python scripts/build_index.py    # 嵌入 → data/chroma
+
+# 方向 A(推荐算法)需要:把公开交互数据集 + corpus 落成推荐算法用表
+# 先把 Steam_November2025_Dataset/(两个 csv)放到仓库根目录,然后:
+python scripts/build_interactions.py   # → data/interactions/{interactions,users,items}.parquet + stats.json
 ```
 
 启动:
@@ -190,7 +212,8 @@ cd backend
 .venv/Scripts/python tests/test_frontend_plan.py
 ```
 
-> ⚠️ 目前只有 `tests/test_steam_client.py` 是真单测(11 个用例,全离线);其余是脚本式的流程验证,没有断言化。补齐 pytest 结构在 [ROADMAP.md](ROADMAP.md) 的 Phase 0 里。
+> ⚠️ 目前真单测是 `tests/test_steam_client.py` + `tests/test_recommend_features.py`(共 23 个用例,全离线);其余是脚本式的流程验证,没有断言化。补齐 pytest 结构在 [ROADMAP.md](ROADMAP.md) 的 Phase 0 里。
+> 💡 只跑离线单测请**指定模块**(如 `python -m unittest tests.test_recommend_features`):`unittest discover` 会 import 全部 `test_*.py`,连带加载 torch + sentence-transformers,实测要 22 秒(`-m unittest discover` 的 22.1s vs 单模块 0.2s)。
 
 ---
 
@@ -279,6 +302,24 @@ done 事件包含:text、intent、dlc_report、profile、candidates、game_analy
 - `lastCandidates`:上次推荐候选,作为 `context.candidates` 传给后端,用于解析"第x个"。
 - UI:`#root { zoom: 1.2 }` 整体放大;Steam 蓝黑主题(变量在 index.css)。
 
+### 6.7 推荐算法(`recommend/`)
+
+方向的完整实现在 **[RECOMMENDER.md](RECOMMENDER.md)**;这里只列模块职责:
+
+| 模块 | 职责 |
+|---|---|
+| `features.py` | 纯函数:评价标签 / 好评率 / 销量下界 / 年份 / 时长分档 / **文本模板(与 build_corpus 共用)** / 贝叶斯平滑 |
+| `index.py` | A2 产物加载(mmap)+ 数组助手(`topk_from_dense` / `cat_rows_of` / `content_topk_from_embeddings`) |
+| `recall.py` | 5 路通道(内容画像 / 内容 kNN / 协同 kNN / 质量热度 / 发行商)+ 配额轮转融合 |
+| `rank.py` | 26 维 `FeatureBuilder`(**训练与线上共用**,避免训练-服务偏斜)+ `Ranker` |
+| `evaluate.py` | 按用户留一切分 + 两套评测协议(全库排序 / 热度匹配)+ 排序指标 |
+| `service.py` | 对外门面 `Recommender` + `get_recommender()` 懒加载单例;冷启动与可解释性 |
+
+要点:
+- **在线零推理** —— `load()` 后 `torch` / `sentence_transformers` 都未被 import(实测)
+- **离线资产 73 MB**,`data/recommend/`(已 gitignore),由 5 个脚本构建(见 RECOMMENDER.md §9.1)
+- **索引缺失时自动降级**到原来的 RAG 路径,服务不会起不来
+
 ---
 
 ## 7. API 接口
@@ -288,7 +329,12 @@ done 事件包含:text、intent、dlc_report、profile、candidates、game_analy
 | GET | `/healthz` | 健康检查 |
 | POST | `/api/library` | `{mode:"steamid", value}` → `{count, games}` |
 | POST | `/api/dlc` | `{games:[...]}`(推荐)或 `{mode:"steamid", value}` → DLC 报告 |
+| POST | `/api/recommend` | `{library:[Game], top_k}` → 结构化候选(**不调 LLM**,P50 ~7ms) |
 | POST | `/api/chat` | `{message, library, context?}` → SSE 流 |
+
+`/api/recommend` 返回每条候选的 `score` / `channels`(由哪几路召回)/
+`because_of`("因为你在玩《X》")/ `match_genres`(与画像重叠的类型),
+以及 `cold_start` 与 `unmatched_in_library` 两个状态标志。
 
 SSE 事件格式(每条 `data: {json}\n\n`):
 
@@ -336,20 +382,32 @@ SSE 事件格式(每条 `data: {json}\n\n`):
 
 ## 10. 路线图
 
-**深化开发的完整计划见 [ROADMAP.md](ROADMAP.md)**,包含:
+**文档分工**:
 
-- 代码盘点(正确性/工程化问题清单)与**多余文件清理清单**
-- **Phase 0 共同地基**:可观测性、LLM 抽象层、评测集、pytest/CI、会话记忆
-- **方向 A**:混合(hybrid)推荐算法 —— 离线预计算 + 协同/内容/社区多路召回 + LightGBM LTR 排序 + 离线评测
-- **方向 B**:本地 LLM 推理服务与调优(AI Infra)—— WSL2 + vLLM + 3B/4B 模型 + QLoRA 微调 + 手搓推理
-- **WSL2 工作区迁移**步骤与踩坑
+| 文档 | 内容 |
+|---|---|
+| 本文档 | **现状**:架构、模块、API、踩坑 |
+| [ROADMAP.md](ROADMAP.md) | **计划**:方向选型、Phase 0、方向 A 各阶段、方向 B 计划、WSL2 迁移 |
+| [RECOMMENDER.md](RECOMMENDER.md) | **推荐算法(方向 A)实现全记录**:数据 / 索引 / 评测协议 / 召回 / 排序 / 在线服务 / 消融 / **已知局限与可优化点** |
+
+### 方向 A(混合推荐算法)—— ✅ 已完成
+
+端到端结果:**recall@10 从改造前的 0.80% 提升到 24.00%(约 30 倍)**,NDCG@10 0.0031 → 0.1430,
+在线 P50 **7.4ms**、常驻 73MB、纯 CPU 零推理。
+完整实现细节、8 个 bug 的根因、以及 **18 条可优化点(按预期收益排序)** 见
+[RECOMMENDER.md](RECOMMENDER.md) §10。
+
+### 方向 B(本地 LLM 推理与调优)—— 计划中
+
+技术路线见 [ROADMAP.md](ROADMAP.md) §4:WSL2 + vLLM + 3B/4B 模型 + QLoRA 微调 + 手搓推理。
 
 ### 已确认的方向决策
 
 | 决策点 | 结论 |
 |---|---|
-| 主方向 | **B 主干(本地 LLM 推理 + 调优)+ A 可做全** |
-| **A 的数据来源** | `corpus.jsonl` **只有物品侧特征,零个 user/interaction 字段**,无法单独支撑推荐算法 → 改用公开交互数据集(首选 Zenodo《Steam_November2025_Dataset》,CC-BY-4.0,7,731 用户 / 9,935 游戏 / 100 万+ 交互);`corpus.jsonl` 转为 **item 特征侧** → 做混合推荐 |
+| 主方向 | **B 主干(本地 LLM 推理 + 调优)+ A 做全** → **A 已完成** |
+| **A 的数据来源** | `corpus.jsonl` **只有物品侧特征,零个 user/interaction 字段**,无法单独支撑推荐算法 → 改用公开交互数据集(Zenodo《Steam_November2025_Dataset》,CC-BY-4.0);`corpus.jsonl` 转为 **item 特征侧** → 做混合推荐 |
+| **A 的嵌入配置** | 端到端裁决为 **保持 `cur128`,不重建**(三配置打平,seed 噪声比配置差异大一个数量级) |
 | **B 的模型与算力** | 开源预训练小模型 **3B/4B**(Qwen3-4B / Qwen2.5-3B 一类)+ **QLoRA**,**全程本地**部署 |
 | **B0 环境** | **WSL2 Ubuntu 22.04 + CUDA + vLLM**(用户已有验证过的 CUDA / PyTorch 环境) |
 | **微调数据** | **自蒸馏**(用 DeepSeek 批量生成训练目标)+ 少量通用中文指令数据防遗忘;held-out 评测集绝不入训练 |
@@ -363,9 +421,9 @@ SSE 事件格式(每条 `data: {json}\n\n`):
 ### 已知限制(现状)
 
 - **无会话记忆**:没有 checkpointer,多轮上下文靠前端回传 `context.candidates`
-- **无评测集/无基线数字**:无法量化"换模型/换算法"的好坏
-- **无结构化日志**:大量 `except Exception: pass` 吞异常,线上不可观测
-- **测试未断言化**:除 `test_steam_client.py` 外,`tests/` 下的脚本只打印不校验
+- **无结构化日志**:大量 `except Exception: pass` 吞异常,线上不可观测(P0.2 未做)
+- **LLM 侧仍无评测集/基线数字**:推荐算法侧已建立(P0.4 只完成了方向 A 需要的部分)
+- **`tests/` 仍是平铺结构**:`unittest discover` 会连带加载 torch,单轮 22s(见 RECOMMENDER.md §9.3)
 
 ---
 
