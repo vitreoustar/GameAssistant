@@ -3,7 +3,11 @@
 事件类型:
   {"type": "node",  "data": {"node": str, "status": "start"|"end"}}  节点状态
   {"type": "token", "node": str, "data": str}                        LLM token 流
-  {"type": "done",  "data": {text, intent, dlc_report, candidates}}  最终结果
+  {"type": "done",  "data": {...}}                                   最终结果
+
+`done` 里多一个 `recommend_state`:本轮之后的偏好 + 已展示 appid。
+前端必须把它**原样回传**(`ChatContext.recommend`),否则下一轮去重记录归零,
+用户会重新看到刚推荐过的游戏 —— 这是多轮推荐最容易踩的坑。
 """
 from __future__ import annotations
 
@@ -22,11 +26,15 @@ async def stream_agent(
     message: str,
     library: list[dict],
     context_candidates: list[dict] | None = None,
+    recommend_state: dict | None = None,
+    history: list[dict] | None = None,
 ) -> AsyncIterator[dict]:
     input_payload = {
         "messages": [HumanMessage(content=message)],
         "library": library or [],
         "context_candidates": context_candidates or [],
+        "recommend_state": recommend_state or None,
+        "history": history or [],
     }
     final_state: dict | None = None
 
@@ -64,5 +72,6 @@ async def stream_agent(
             "candidates": final_state.get("candidates"),
             "game_analysis": final_state.get("game_analysis"),
             "game_candidates": final_state.get("game_candidates"),
+            "recommend_state": final_state.get("recommend_state"),
         },
     }

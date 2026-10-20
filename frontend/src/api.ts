@@ -1,7 +1,9 @@
-import type { Game, StreamEvent } from './types'
+import type { ChatTurn, Game, RecommendState, StreamEvent } from './types'
 
 export interface ChatContext {
   candidates: { appid: number; name: string }[]
+  recommend: RecommendState | null
+  history: ChatTurn[]
 }
 
 export async function importLibrary(mode: string, value: string): Promise<Game[]> {

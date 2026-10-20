@@ -61,6 +61,7 @@ export default function ChatPanel({ messages, steps, streaming, onSend }: Props)
         <div className="quick-btns">
           <button onClick={() => send('整理一下我的 DLC')}>📦 整理 DLC</button>
           <button onClick={() => send('推荐几款我可能喜欢的游戏')}>🎮 推荐游戏</button>
+          <button onClick={() => send('换一批，再推荐点别的')}>🔁 换一批</button>
         </div>
         <div className="input-row">
           <input

@@ -24,8 +24,14 @@ from app.agent.prompts import (
 )
 from app.config import settings
 from app.rag import store as rag_store
+from app.recommend.notes import constraint_note
+from app.recommend.preferences import PreferenceState, parse_message
 from app.steam import client as steam_client
 from app.steam.dlc import build_dlc_report
+
+RECOMMEND_TOP_K = 5      # 每次推荐展示几款
+HISTORY_TURNS = 6        # 路由/偏好抽取时最多回看几轮对话
+PREDEFINED_INTENTS = {"dlc", "dlc_detail", "recommend", "game_ask", "chat"}
 
 
 class AgentState(TypedDict):
@@ -38,6 +44,9 @@ class AgentState(TypedDict):
     game_analysis: dict | None
     game_candidates: list[dict]
     context_candidates: list[dict]
+    # ---- 多轮对话状态 ----
+    history: list[dict]                  # 之前的若干轮 [{"role","text"}],仅供 LLM 消解指代
+    recommend_state: dict | None         # 累积的偏好 + 已展示 appid(前端回传)
 
 
 def get_llm() -> ChatOpenAI:
@@ -65,30 +74,74 @@ async def _llm_stream_text(messages: list[BaseMessage]) -> str:
 
 # ---------- 路由 ----------
 
+def _history_context(history: list[dict]) -> str:
+    """把最近几轮对话压成一段纯文本,给路由 LLM 消解省略和指代。"""
+    lines: list[str] = []
+    for turn in history[-HISTORY_TURNS:]:
+        if not isinstance(turn, dict):
+            continue
+        role = "用户" if turn.get("role") == "user" else "助手"
+        text = str(turn.get("text") or "").strip().replace("\n", " ")
+        if text:
+            lines.append(f"{role}:{text[:200]}")
+    return "\n".join(lines)
+
+
+async def _parse_router(message: str, history: list[dict], prefer: list[str]) -> dict:
+    """一次 LLM 调用同时得到意图与偏好增量。
+
+    合并成一次调用是刻意的:路由本来就在每条消息上跑,再单独加一轮"偏好抽取"
+    会让每条消息多 300~600ms,而两者都是"读一句话做分类"的性质。
+    """
+    llm = get_llm().bind(response_format={"type": "json_object"})
+    blocks: list[str] = []
+    context = _history_context(history)
+    if context:
+        blocks.append(f"历史对话(旧→新):\n{context}")
+    if prefer:
+        blocks.append(f"用户此前已经说过的偏好(不要重复提取):{'、'.join(prefer)}")
+    blocks.append(f"当前用户消息:{message}")
+    resp = await llm.ainvoke(
+        [SystemMessage(content=ROUTER_PROMPT), HumanMessage(content="\n\n".join(blocks))]
+    )
+    data = json.loads(str(resp.content or ""))
+    if not isinstance(data, dict):
+        raise ValueError("路由结果不是 JSON 对象")
+    return data
+
+
 async def route_node(state: AgentState) -> dict:
     message = str(state["messages"][-1].content)
-    if not settings.deepseek_api_key:
-        return {"intent": _keyword_route(message)}
-    try:
-        llm = get_llm().bind(response_format={"type": "json_object"})
-        resp = await llm.ainvoke(
-            [
-                SystemMessage(content=ROUTER_PROMPT),
-                HumanMessage(content=message),
-            ]
-        )
-        intent = "chat"
-        try:
-            data = json.loads(resp.content)
-            intent = data.get("intent", "chat")
-        except (json.JSONDecodeError, AttributeError):
-            pass
-    except Exception:
-        intent = _keyword_route(message)
+    history = state.get("history") or []
+    current = PreferenceState.from_dict(state.get("recommend_state"))
 
-    if intent not in {"dlc", "dlc_detail", "recommend", "game_ask", "chat"}:
+    pref: dict = {}
+    if settings.deepseek_api_key:
+        try:
+            data = await _parse_router(message, history, current.genres)
+            intent = data.get("intent", "chat")
+            raw_pref = data.get("pref")
+            if isinstance(raw_pref, dict):
+                pref = raw_pref
+        except Exception:
+            intent = _keyword_route(message)
+            pref = parse_message(message)
+    else:
+        intent = _keyword_route(message)
+        pref = parse_message(message)
+
+    if intent not in PREDEFINED_INTENTS:
         intent = "chat"
-    return {"intent": intent}
+
+    restart = bool(pref.get("restart")) if isinstance(pref, dict) else False
+    updated = current.merge(pref, restart=restart)
+
+    # 用户只说"我更喜欢策略类"、没说要推荐时,路由常会判成 chat。
+    # 只要抽到了具体类型偏好,就说明 ta 是想看看这类游戏 —— 升级为推荐意图。
+    if intent == "chat" and (updated.genres or updated.avoid):
+        intent = "recommend"
+
+    return {"intent": intent, "recommend_state": updated.to_dict()}
 
 
 def _keyword_route(message: str) -> str:
@@ -102,7 +155,15 @@ def _keyword_route(message: str) -> str:
         return "game_ask"
     if any(k in m for k in ("怎么样", "好不好玩", "好玩吗", "值得买", "值得玩", "评价", "如何")):
         return "game_ask"
-    if any(k in m for k in ("推荐", "recommend", "喜欢", "好玩", "类似")):
+    # "换一批/再来点/别的"这类追问也属于推荐意图,否则会掉进闲聊节点
+    if any(
+        k in m
+        for k in (
+            "推荐", "recommend", "喜欢", "好玩", "类似",
+            "换一批", "换些", "换个", "再来", "再推荐", "还有吗", "还有别的",
+            "别的", "其他的", "其他类型", "看看其他",
+        )
+    ):
         return "recommend"
     return "chat"
 
@@ -345,38 +406,67 @@ async def _profile_for(games: list[dict]) -> dict:
     return await _build_profile(games)
 
 
+def _constraint_note(result, pref: PreferenceState) -> str:
+    """把"这一轮到底命中了多少"写成一句确定性的实话(实现见 `app/recommend/notes.py`)。"""
+    return constraint_note(result, pref.unmapped)
+
+
 async def recommend_node(state: AgentState) -> dict:
-    """推荐节点:本地混合召回 + LTR 精排,LLM 只负责写开场白与理由。
+    """推荐节点:本地混合召回 + LTR 精排 + 对话约束,LLM 只负责写开场白与理由。
 
     与改造前的区别(见 docs/ROADMAP.md §A6):
       * 召回不再跑 embedding 推理,也不再打 Steam —— 纯查表 + 点积
-      * 在线延迟 P50 7.4ms / P99 8.4ms(常规库大小)
+      * 在线延迟 P50 9.1ms(常规库大小),零模型推理
       * 候选质量:recall@10 从 0.80% 提到 24.00%
+
+    多轮改造(§A7):推荐器本身是**游戏库的纯函数**,不喂对话状态就永远返回同一批。
+    所以这里补上两件状态:
+      * 排除已经展示过的游戏 —— 否则"再推荐点别的"原样返回上一批
+      * 把用户逐轮说出的类型偏好当**过滤器**注入,让明说的偏好决定"要不要",
+        游戏历史决定"要哪个"
     本地索引不可用时自动退回原来的 RAG 路径,保证最差仍可用。
     """
     games = state.get("library") or []
     if not games:
         return {"messages": [AIMessage(content="先连接你的游戏库,我才能推荐哦~")]}
 
+    pref = PreferenceState.from_dict(state.get("recommend_state"))
     recommender = _local_recommender()
     if recommender is None:
-        return await _recommend_via_rag(games)
+        return await _recommend_via_rag(games, pref)
 
-    result = recommender.recommend(games, top_k=5)
+    result = recommender.recommend(
+        games,
+        top_k=RECOMMEND_TOP_K,
+        exclude_appids=pref.shown,
+        prefer=pref.genres,
+        avoid=pref.avoid,
+    )
     profile = result.profile
     cand_list = [r.as_dict() for r in result.recommendations]
+
     if not cand_list:
         if result.cold_start:
             text = "你的库里还没有我能识别的游戏。换个 SteamID 试试,或者告诉我你喜欢什么类型?"
+        elif result.exhausted:
+            text = "能推的我基本都推过一轮了,暂时没有新的了。要不换个方向,或者放宽一点条件?"
         else:
             text = "你的游戏库已经覆盖了我语料里所有相关的游戏,暂时没有新的可以推荐了 🎉"
-        return {"profile": profile, "messages": [AIMessage(content=text)]}
+        # 即使这一轮没候选也要把状态写回去 —— 否则下一轮前端拿到的 `shown` 会回退
+        return {"profile": profile, "recommend_state": pref.to_dict(),
+                "messages": [AIMessage(content=text)]}
 
-    intro, reasons = await _generate_reasons(profile, cand_list)
+    note = _constraint_note(result, pref)
+    intro, reasons = await _generate_reasons(profile, cand_list, pref, note)
     for c in cand_list:
-        c["reason"] = reasons.get(c["appid"]) or _fallback_reason(c, profile)
+        c["reason"] = reasons.get(c["appid"]) or _fallback_reason(c, profile, pref)
 
-    if intro:
+    if note:
+        # 有了约束结论就**先说结论**:用户更需要知道"命中了几款",而不是一段热情的开场白
+        text = note + ("\n\n" + intro if intro else "")
+        if not intro and not result.no_match:
+            text += "\n" + _fallback_recommend(cand_list)
+    elif intro:
         text = intro
     else:
         text = _fallback_recommend(cand_list)
@@ -384,13 +474,27 @@ async def recommend_node(state: AgentState) -> dict:
             text = "你的库里暂时没有我能分析的常玩游戏,先按口碑和热度挑几款 🎮\n" + text
         elif result.unmatched_in_library:
             text += f"(有 {result.unmatched_in_library} 款游戏不在我的语料里,这次没纳入分析)"
-    return {"profile": profile, "candidates": cand_list, "messages": [AIMessage(content=text)]}
+
+    next_state = pref.with_shown([c["appid"] for c in cand_list])
+    return {
+        "profile": profile,
+        "candidates": cand_list,
+        "recommend_state": next_state.to_dict(),
+        "messages": [AIMessage(content=text)],
+    }
 
 
-async def _recommend_via_rag(games: list[dict]) -> dict:
-    """降级路径:原来的多查询 RAG 召回(本地推荐索引不可用时使用)。"""
+async def _recommend_via_rag(
+    games: list[dict], pref: PreferenceState | None = None
+) -> dict:
+    """降级路径:原来的多查询 RAG 召回(本地推荐索引不可用时使用)。
+
+    能做的只有"排除已推荐的"和"排除已拥有的"—— 偏好过滤依赖目录里的类型矩阵,
+    这条路径没有。但 `recommend_state` 照样要写回去,否则降级期间去重也会失效。
+    """
+    pref = pref or PreferenceState()
     profile = await _build_profile(games)
-    owned = {g["appid"] for g in games}
+    owned = {g["appid"] for g in games} | set(pref.shown)
 
     candidates: dict[int, dict] = {}
     for q in _build_queries(profile, games):
@@ -403,32 +507,63 @@ async def _recommend_via_rag(games: list[dict]) -> dict:
         c["reason"] = reasons.get(c["appid"]) or _fallback_reason(c, profile)
 
     text = intro or _fallback_recommend(cand_list)
-    return {"profile": profile, "candidates": cand_list, "messages": [AIMessage(content=text)]}
+    return {
+        "profile": profile,
+        "candidates": cand_list,
+        "recommend_state": pref.with_shown([c["appid"] for c in cand_list]).to_dict(),
+        "messages": [AIMessage(content=text)],
+    }
 
 
-async def _generate_reasons(profile: dict, candidates: list[dict]) -> tuple[str, dict[int, str]]:
+async def _generate_reasons(
+    profile: dict,
+    candidates: list[dict],
+    pref: PreferenceState | None = None,
+    note: str = "",
+) -> tuple[str, dict[int, str]]:
     """LLM 生成开场白 + 每款候选的推荐理由(JSON)。
 
-    候选行里带上本地召回器给出的证据(`because_of` / `match_genres`),
-    让理由能落到"因为你玩了《X》"这种具体依据上,而不是泛泛而谈。
+    候选行里带上本地召回器给出的证据(`pref_match` / `because_of` / `match_genres`),
+    让理由能落到"正好对上你说的策略类"或"因为你玩了《X》"这种具体依据上。
     """
     if not settings.deepseek_api_key:
         return "", {}
+    blocks: list[str] = [f"用户长期偏好(来自游戏库):{profile['summary']}"]
+    if pref is not None and (pref.genres or pref.avoid):
+        stated: list[str] = []
+        if pref.genres:
+            stated.append(f"想要:{'、'.join(pref.genres)}")
+        if pref.avoid:
+            stated.append(f"不要:{'、'.join(pref.avoid)}")
+        blocks.append("用户这次明确说:" + ";".join(stated))
+    if pref is not None and pref.unmapped:
+        blocks.append(f"用户提到但我没有对应标签的类型:{'、'.join(pref.unmapped)}")
+    if note:
+        # 这段话由 `recommend_node` **原样前置**给用户,所以这里要明确告诉 LLM
+        # "别重复、别反驳",否则同一句"我没有这个标签"会被说两遍。
+        blocks.append(f"系统已提示用户的内容(勿重复、勿反驳,接着往下写):{note}")
+
     lines: list[str] = []
     for c in candidates:
         parts = [f"- {c['appid']} | {c['name']} | {c['genres']}"]
+        if c.get("pref_match"):
+            parts.append(f"对上你说的偏好:{'、'.join(c['pref_match'])}")
         if c.get("match_genres"):
-            parts.append(f"与用户偏好重叠:{'、'.join(c['match_genres'])}")
+            parts.append(f"与库内偏好重叠:{'、'.join(c['match_genres'])}")
         if c.get("because_of"):
             parts.append(f"用户在玩《{c['because_of']}》")
         if c.get("channels"):
             parts.append(f"召回来源:{'/'.join(c['channels'])}")
         lines.append(" | ".join(parts))
-    human = f"用户偏好:\n{profile['summary']}\n\n候选游戏:\n" + "\n".join(lines)
+    blocks.append("候选游戏:\n" + "\n".join(lines))
+
     try:
         llm = get_llm().bind(response_format={"type": "json_object"})
         resp = await llm.ainvoke(
-            [SystemMessage(content=RECOMMEND_REASONS_PROMPT), HumanMessage(content=human)]
+            [
+                SystemMessage(content=RECOMMEND_REASONS_PROMPT),
+                HumanMessage(content="\n\n".join(blocks)),
+            ]
         )
         data = json.loads(str(resp.content or ""))
         intro = str(data.get("intro", ""))
@@ -441,13 +576,19 @@ async def _generate_reasons(profile: dict, candidates: list[dict]) -> tuple[str,
         return "", {}
 
 
-def _fallback_reason(candidate: dict, profile: dict) -> str:
+def _fallback_reason(
+    candidate: dict, profile: dict, pref: PreferenceState | None = None
+) -> str:
     """LLM 不可用时的确定性理由。
 
-    优先用本地召回器给出的证据(`because_of` / `match_genres`),它们比"类型相近"
-    具体得多;只有在都没有时才退回泛泛的类型对比。
+    优先用本地召回器给出的证据(`pref_match` / `because_of` / `match_genres`),
+    它们比"类型相近"具体得多;用户明说过偏好却没命中时**如实说明**,而不是含糊过去。
     """
     parts: list[str] = []
+    if candidate.get("pref_match"):
+        parts.append(f"正好对上你说的「{'、'.join(candidate['pref_match'][:2])}」")
+    elif pref is not None and pref.genres:
+        parts.append(f"它没对上你说的「{'、'.join(pref.genres[:2])}」")
     if candidate.get("because_of"):
         parts.append(f"你在玩《{candidate['because_of']}》,这款和它路子很像")
     if candidate.get("match_genres"):

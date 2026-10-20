@@ -8,12 +8,36 @@ SYSTEM_PROMPT = """你是 SteamAssistant,一个友好热情的游戏助手 🎮�
 
 说话轻松自然、口语化,适当用 emoji,用中文回复。"""
 
-ROUTER_PROMPT = """判断用户消息的意图,只返回一个 JSON 对象,不要输出其他内容:
-{"intent": "dlc"}         —— 想整体整理/查看 DLC 概况
-{"intent": "dlc_detail"}  —— 想展开查看某款游戏的完整 DLC 列表
-{"intent": "recommend"}   —— 想要游戏推荐
-{"intent": "game_ask"}    —— 问某款游戏怎么样/好不好玩/评价/详细介绍(包括「第x个」指代推荐中的游戏)
-{"intent": "chat"}        —— 其他闲聊或一般问题
+ROUTER_PROMPT = """判断用户消息的意图,并顺带抽取 ta **明确说出**的游戏类型偏好。
+只返回一个 JSON 对象,不要输出其他内容:
+{"intent": "...", "pref": {"genres": [], "avoid": [], "unmapped": [], "restart": false}}
+
+intent 取以下之一:
+- "dlc"         —— 想整体整理/查看 DLC 概况
+- "dlc_detail"  —— 想展开查看某款游戏的完整 DLC 列表
+- "recommend"   —— 想要游戏推荐、换一批、再推荐点别的
+- "game_ask"    —— 问某款游戏怎么样/好不好玩/评价/详细介绍(包括「第x个」指代推荐里的游戏)
+- "chat"        —— 其他闲聊或一般问题
+
+pref 四个字段(用户没有明确表达偏好时全部留空):
+- "genres": 用户**想要**的类型/玩法。**只能**从下面这个词表里挑,用英文原文:
+  Action / Adventure / RPG / Strategy / Simulation / Casual / Indie / Racing / Sports /
+  Massively Multiplayer / Free To Play / Early Access / Violent / Gore / Nudity /
+  Single-player / Multi-player / Co-op / Online Co-op / PvP / Online PvP /
+  Shared/Split Screen / MMO / Steam Workshop / In-App Purchases
+- "avoid": 用户**明确不要**的,同样只能用上面的词表。
+- "unmapped": 用户提到了、但**上面词表里没有对应项**的类型词,填用户自己的原词。
+  「恐怖」「潜行」「魂系」「肉鸽」「开放世界」「像素风」「武侠」这些都不在词表里,
+  必须放进 unmapped,**不要**硬塞进 genres —— 硬塞会让系统按错误的条件去筛。
+- "restart": 用户是否**推翻**了之前说的偏好(如「我说错了」「重新来」「别管我刚才说的」),
+  是就 true,否则 false。
+
+几条判断规则:
+- 「换一批」「再推荐点别的」「还有吗」只是要新的一批,**不是**否定之前的偏好:
+  pref 留空、restart 为 false,系统自己会排除已经推荐过的。
+- 用户只说偏好、没说要推荐(如「我最近比较喜欢策略类」)时,intent 用 "recommend"。
+- 结合历史对话理解省略和指代:如果上一轮助手问「要不要看看其他类型」而用户答「好」,
+  这句「好」不是闲聊,应判为 "recommend" 并置 restart 为 true。
 
 直接返回 JSON:"""
 
@@ -31,8 +55,16 @@ EXTRACT_GAME_PROMPT = """从用户消息中提取 ta 在询问的游戏名称(�
 游戏名:"""
 
 RECOMMEND_REASONS_PROMPT = """你是游戏搭子 🎮。根据用户偏好,做两件事:
-1. 写一段 2-4 句的开场白(intro):先总结用户喜欢的类型/玩法,再说明这次推荐的大致方向,结尾问一句"你对哪个比较感兴趣呢?"。
+1. 写一段 2-4 句的开场白(intro):先总结用户喜欢的类型/玩法,再说明这次推荐的大致方向,
+   结尾问一句"你对哪个比较感兴趣呢?"。
 2. 为每款候选游戏写一句 30-60 字的推荐理由(reason),结合用户偏好说清"为什么你会喜欢"。
+
+特别注意:
+- 如果用户消息里给了「系统已提示用户的内容」,那段话**已经原样展示在用户面前了**:
+  你**不要重复它**,也不要反驳它,直接接着往下写"为什么挑这几款"即可。
+- 候选行里的「对上你说的偏好」是这条游戏真正命中的、用户明说的类型;
+  没有这一项的候选就是**没对上**,理由要如实写"这款没对上你说的 X,但……",
+  不要谎称符合。
 
 只返回 JSON,格式(不要 markdown、不要多余文字):
 {"intro": "……", "reasons": [{"appid": 570, "reason": "……"}, ...]}

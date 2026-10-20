@@ -43,24 +43,26 @@ FastAPI
         │
         ▼
 LangGraph Agent(StateGraph)
-  ├─ route        意图路由(LLM JSON + 关键词兜底)
+  ├─ route        意图路由 + **偏好抽取**(LLM JSON / 关键词兜底)
   ├─ dlc          DLC 整理
   ├─ dlc_detail   DLC 追问展开
-  ├─ recommend    个性化推荐(RAG)
+  ├─ recommend    个性化推荐(本地混合召回 + LTR,**按对话去重与偏好过滤**)
   ├─ game_ask     游戏评测/匹配分析
   └─ chat         闲聊
         │
         ├─ SteamClient(Web API / Store API)
-        ├─ ChromaDB(5362 款游戏语料)
-        └─ DeepSeek LLM
+        ├─ 本地推荐器(离线索引 + LightGBM,零推理)
+        ├─ ChromaDB(5362 款游戏语料,降级兜底)
+        └─ DeepSeek LLM(写文案,不参与排序)
 ```
 
 **数据流(一次"推荐")**:
-1. 前端把 `{message, library, context}` POST 到 `/api/chat`
-2. route 节点判断 intent=recommend
-3. recommend 节点:画像(类型统计)→ 多查询 RAG 检索 → 过滤已拥有 → top5 → LLM 生成开场白 + 逐条理由(JSON)
-4. 通过 `astream_events` 把 node 事件 + token 流 + 最终卡片数据以 SSE 推给前端
-5. 前端在对话里内联渲染卡片(封面/标签/评价/价格/理由)
+1. 前端把 `{message, library, context{candidates, recommend, history}}` POST 到 `/api/chat`
+2. route 节点判断 intent=recommend,并顺带从这句话里抽出**偏好增量**(想要/不要哪些类型)
+3. 推荐节点:本地混合召回 200 条 → LTR 精排 → 剔除已展示过(含同名)/不想要的 →
+   命中明说偏好的排前面 → top5 → LLM 只写开场白 + 逐条理由
+4. 通过 `astream_events` 把 node 事件 + token 流 + 最终卡片数据 + **新的 `recommend_state`** 推给前端
+5. 前端在对话里内联渲染卡片,并把 `recommend_state` 存起来下一轮回传
 
 ---
 
@@ -90,8 +92,8 @@ SteamAssistant/
 │  │  ├─ routers/
 │  │  │  ├─ library.py        # POST /api/library
 │  │  │  ├─ dlc.py            # POST /api/dlc
-│  │  │  ├─ recommend.py      # POST /api/recommend(本地推荐器,不调 LLM,~7ms)
-│  │  │  └─ chat.py           # POST /api/chat(SSE 流式)
+│  │  │  ├─ recommend.py      # POST /api/recommend(本地推荐器,不调 LLM,~9ms)
+│  │  │  └─ chat.py           # POST /api/chat(SSE 流式 + 多轮状态回传)
 │  │  ├─ agent/
 │  │  │  ├─ graph.py          # ★ LangGraph 图、各节点、画像、推荐、评测
 │  │  │  ├─ stream.py         # ★ astream_events → SSE 事件
@@ -106,7 +108,9 @@ SteamAssistant/
 │  │  │  ├─ recall.py         # ★ A3 五路召回 + 配额轮转融合
 │  │  │  ├─ rank.py           # ★ A4 特征构造(训练/线上共用)+ 排序器
 │  │  │  ├─ evaluate.py       # 留一切分 + 排序指标 + 两套评测协议
-│  │  │  └─ service.py        # ★ A5 对外门面 + 懒加载单例
+│  │  │  ├─ preferences.py    # ★ A7 对话偏好状态机 + 封闭词表 + 关键词兜底
+│  │  │  ├─ notes.py          # ★ A7 "命中了几款"的确定性文案
+│  │  │  └─ service.py        # ★ A5 对外门面 + 懒加载单例(含多轮去重/偏好分桶)
 │  │  └─ steam/
 │  │     ├─ client.py         # ★ SteamClient(缓存/令牌桶限速/并发/搜索/评价)
 │  │     ├─ dlc.py            # DLC 计算(拥有状态求交、上限、截断)
@@ -202,7 +206,12 @@ npm run dev                      # http://localhost:5173
 ```bash
 cd backend
 # 离线单测(不需要任何 key / 网络)
-.venv/Scripts/python -m unittest discover -s tests -v
+.venv/Scripts/python -m unittest tests.test_recommend_features tests.test_recommend_index \
+  tests.test_recommend_evaluate tests.test_recommend_recall tests.test_recommend_rank \
+  tests.test_recommend_service tests.test_recommend_preferences tests.test_steam_client
+
+# 多轮对话整图测试(离线,但会 import app.agent → 加载 torch,约 23s)
+.venv/Scripts/python -m unittest tests.test_multiturn_agent
 
 # 手工联调脚本(需要真实 key + 网络)
 .venv/Scripts/python tests/test_recommend.py
@@ -212,7 +221,8 @@ cd backend
 .venv/Scripts/python tests/test_frontend_plan.py
 ```
 
-> ⚠️ 目前真单测是 `tests/test_steam_client.py` + `tests/test_recommend_features.py`(共 23 个用例,全离线);其余是脚本式的流程验证,没有断言化。补齐 pytest 结构在 [ROADMAP.md](ROADMAP.md) 的 Phase 0 里。
+> ⚠️ 目前**真单测共 135 个**(离线 129 + 多轮整图 6);剩下几个是脚本式的流程验证,没有断言化。
+> 补齐 pytest 结构在 [ROADMAP.md](ROADMAP.md) 的 Phase 0 里。
 > 💡 只跑离线单测请**指定模块**(如 `python -m unittest tests.test_recommend_features`):`unittest discover` 会 import 全部 `test_*.py`,连带加载 torch + sentence-transformers,实测要 22 秒(`-m unittest discover` 的 22.1s vs 单模块 0.2s)。
 
 ---
@@ -228,16 +238,18 @@ messages: Annotated[list, add_messages]  # 对话,add_messages reducer 追加
 library: list[dict]                      # 用户游戏库
 intent: str                              # 路由结果
 dlc_report / profile / candidates / game_analysis / game_candidates / context_candidates
+history: list[dict]                      # 最近几轮对话,仅供路由消解省略与指代
+recommend_state: dict | None             # 累积偏好 + 已展示 appid(前端回传,见 §6.7)
 ```
 
 **节点与职责**:
 
 | 节点 | 职责 |
 |---|---|
-| route | LLM(JSON)判断 intent;失败走 `_keyword_route` 关键词兜底 |
+| route | LLM(JSON)判断 intent **并顺带抽取偏好增量**;失败走 `_keyword_route` 关键词兜底 |
 | dlc | `build_dlc_report(top20, cap8)` + LLM 总结 → 侧栏表 |
 | dlc_detail | 追问展开某游戏完整 DLC(解析游戏名) |
-| recommend | 画像 → 多查询 RAG → top5 → LLM 生成 intro+reasons(JSON)→ 内联卡片 |
+| recommend | 本地混合召回 → LTR 精排 → **去重 + 偏好分桶** → top5 → LLM 只写 intro+reasons |
 | game_ask | 解析游戏名(第x个/中英文搜索)→ 详情+真实评价 → 匹配分析 |
 | chat | 直接 LLM 回复 |
 
@@ -246,9 +258,10 @@ dlc_report / profile / candidates / game_analysis / game_candidates / context_ca
 - `get_llm()`:LLM 唯一入口(替换本地 LLM 就改这里)
 - `_llm_stream_text()`:流式生成并拼接(节点内用 astream 才有 token 流)
 - `_top_games_by_playtime(games, n)`:按游玩时长降序取 Top N。**画像与查询都必须走它** —— `library` 的顺序由 Steam 决定(近似按 appid),直接切片会取到与偏好无关的随机游戏
-- `_build_profile()`:取时长 Top30 → 统计 genres/categories 频率 → 画像
-- `_build_queries()`:画像 → 多条查询(类型 + "Games similar to X")
-- `_generate_reasons()`:LLM 返回 JSON {intro, reasons}
+- `_build_profile()`:取时长 Top30 → 统计 genres/categories 频率 → 画像(有本地推荐器时走 `_profile_for`,零网络请求)
+- `_parse_router()`:**一次 LLM 调用同时得到 intent 与偏好增量**(多花一次调用要 300~600ms,而两者都是"读一句话做分类")
+- `_constraint_note()`:把"这轮命中了几款"写成确定性实话(实现在 `recommend/notes.py`)
+- `_generate_reasons()`:LLM 返回 JSON {intro, reasons};候选行带 `pref_match` / `because_of` 作证据
 - `_extract_game_name()`:LLM 从消息抽取游戏名
 - `_resolve_game_appids()` / `_search_store()` / `_filter_games()`:游戏名解析(英文子串 → LLM 抽取 → 中文商店搜索 → 过滤 type==game)
 - `_extract_ordinal()`:解析"第x个/第x款";**没有可用候选时直接给提示**,不再把「第2个」当游戏名去搜商店
@@ -261,7 +274,8 @@ dlc_report / profile / candidates / game_analysis / game_candidates / context_ca
 - `on_chat_model_stream` → token 事件(按 `metadata.langgraph_node` 过滤,route 的 JSON 不外泄)
 - 根链 `on_chain_end` → 最终 state(取 done 事件)
 
-done 事件包含:text、intent、dlc_report、profile、candidates、game_analysis、game_candidates。
+done 事件包含:text、intent、dlc_report、profile、candidates、game_analysis、
+game_candidates、**recommend_state**。最后一个必须由前端原样回传,否则下一轮的去重记录归零。
 
 ### 6.3 RAG(`rag/`)
 
@@ -297,9 +311,12 @@ done 事件包含:text、intent、dlc_report、profile、candidates、game_analy
 
 ### 6.6 前端(`frontend/src/`)
 
-- `App.tsx`:持有 library/messages/steps/dlcReport/lastCandidates 状态;SSE done 事件把 candidates/game_analysis/game_candidates 统一 `toCard()` 成 `GameCard[]`,挂到 assistant 消息上(`cardPosition: before/after`)。
+- `App.tsx`:持有 library/messages/steps/dlcReport/lastCandidates/**recommendState** 状态;SSE done 事件把 candidates/game_analysis/game_candidates 统一 `toCard()` 成 `GameCard[]`,挂到 assistant 消息上(`cardPosition: before/after`)。
 - `api.ts`:`streamChat` 用 fetch ReadableStream 逐块解析 `data:` 事件。
 - `lastCandidates`:上次推荐候选,作为 `context.candidates` 传给后端,用于解析"第x个"。
+- `recommendState`:多轮推荐状态(偏好 + 已展示 appid),由 done 事件给出、下一轮原样回传。**这一轮哪怕没有候选也要更新**,否则去重记录回退。
+- 历史对话用 `useRef` 而非 state 读取:依赖里没有 `messages` 的 `useCallback` 会读到过期闭包,而 ref 在调用瞬间拿到的正是本次发送之前的消息。
+- 换游戏库时重置 `recommendState`(旧 `shown` 是上一份库的记录,留着会让新库没东西可推)。
 - UI:`#root { zoom: 1.2 }` 整体放大;Steam 蓝黑主题(变量在 index.css)。
 
 ### 6.7 推荐算法(`recommend/`)
@@ -313,12 +330,16 @@ done 事件包含:text、intent、dlc_report、profile、candidates、game_analy
 | `recall.py` | 5 路通道(内容画像 / 内容 kNN / 协同 kNN / 质量热度 / 发行商)+ 配额轮转融合 |
 | `rank.py` | 26 维 `FeatureBuilder`(**训练与线上共用**,避免训练-服务偏斜)+ `Ranker` |
 | `evaluate.py` | 按用户留一切分 + 两套评测协议(全库排序 / 热度匹配)+ 排序指标 |
+| `preferences.py` | **A7 多轮**:`PreferenceState` 状态机 + 25 词封闭词表 + 关键词兜底抽取 |
+| `notes.py` | **A7 多轮**:"命中了几款"的确定性文案(纯标准库,便于秒级测试) |
 | `service.py` | 对外门面 `Recommender` + `get_recommender()` 懒加载单例;冷启动与可解释性 |
 
 要点:
 - **在线零推理** —— `load()` 后 `torch` / `sentence_transformers` 都未被 import(实测)
 - **离线资产 73 MB**,`data/recommend/`(已 gitignore),由 5 个脚本构建(见 RECOMMENDER.md §9.1)
 - **索引缺失时自动降级**到原来的 RAG 路径,服务不会起不来
+- **多轮约束施加在排序之后**(不是之前):`merge_rank` 特征依赖候选在召回池里的位置,
+  先过滤再排序会让特征分布偏离训练时口径。详见 RECOMMENDER.md §11.4
 
 ---
 
@@ -329,19 +350,29 @@ done 事件包含:text、intent、dlc_report、profile、candidates、game_analy
 | GET | `/healthz` | 健康检查 |
 | POST | `/api/library` | `{mode:"steamid", value}` → `{count, games}` |
 | POST | `/api/dlc` | `{games:[...]}`(推荐)或 `{mode:"steamid", value}` → DLC 报告 |
-| POST | `/api/recommend` | `{library:[Game], top_k}` → 结构化候选(**不调 LLM**,P50 ~7ms) |
+| POST | `/api/recommend` | `{library, top_k, exclude_appids?, prefer?, avoid?}` → 结构化候选(**不调 LLM**,P50 ~9ms) |
 | POST | `/api/chat` | `{message, library, context?}` → SSE 流 |
 
 `/api/recommend` 返回每条候选的 `score` / `channels`(由哪几路召回)/
-`because_of`("因为你在玩《X》")/ `match_genres`(与画像重叠的类型),
-以及 `cold_start` 与 `unmatched_in_library` 两个状态标志。
+`because_of`("因为你在玩《X》")/ `match_genres`(与**长期画像**重叠的类型)/
+`pref_match`(与**本轮明说偏好**重叠的类型),以及 `cold_start`、
+`unmatched_in_library`、`matched_count`、`relaxed`、`no_match`、`exhausted`、
+`skipped_shown` 这些状态标志。
+
+`/api/chat` 的 `context`(前端持有,服务端不存会话):
+
+| 字段 | 用途 |
+|---|---|
+| `candidates` | 上次推荐候选,解析「第 x 个」 |
+| `recommend` | `{genres, avoid, unmapped, shown, turn}`,多轮去重与偏好过滤 |
+| `history` | 最近 8 轮(每轮截 400 字),让路由理解「好」「换一批」这类省略 |
 
 SSE 事件格式(每条 `data: {json}\n\n`):
 
 ```json
 {"type":"node","data":{"node":"recommend","status":"start"}}
 {"type":"token","node":"recommend","data":"这"}
-{"type":"done","data":{"text":"...","intent":"recommend","candidates":[...],"game_analysis":null,"game_candidates":null}}
+{"type":"done","data":{"text":"...","intent":"recommend","candidates":[...],"game_analysis":null,"game_candidates":null,"recommend_state":{...}}}
 {"type":"error","data":"..."}
 ```
 
@@ -377,6 +408,9 @@ SSE 事件格式(每条 `data: {json}\n\n`):
 8. **Windows 端口占用报 WinError 10013** → `netstat -ano | findstr :8000` + `taskkill /F /PID`。
 9. **`app/steam/__init__.py` 里的单例叫 `client`,与子模块 `app.steam.client` 同名**:所以 `from app.steam import client` 拿到的是**实例**,`import app.steam.client as c` 拿到的也是**实例**。要看模块本身得用 `importlib.import_module("app.steam.client")`。改动 Steam 客户端时注意这个坑。
 10. **ChromaDB `delete_collection` 不会删掉旧的 HNSW segment 目录** → 反复 `build_index.py` 会在 `data/chroma/` 下留下孤儿目录,需要手工清理。
+11. **"目录下标"与"候选池内位置"是两个索引空间** → 同名去重踩过这个坑:按 `cat_idx` 排的数组被用池内位置索引,表现是**随机失效**(小目录下位置常与 `cat_idx` 撞对,单测反而通过)。用前先 `arr[rows]` 重排。
+12. **`app/agent/__init__.py` 会 `import graph`** → 任何 `app.agent.*` 的导入都会拉起 torch + sentence-transformers(14s)。纯函数别放在 `app/agent/` 下,除非愿意为它等 14 秒。
+13. **用 `SimpleNamespace` 造假结果测不出字段漂移** → 假对象恰好带着真对象没有的字段,测试永远绿,线上直接 `AttributeError`。要么用真 dataclass,要么加一条整图测试。
 
 ---
 
@@ -393,9 +427,14 @@ SSE 事件格式(每条 `data: {json}\n\n`):
 ### 方向 A(混合推荐算法)—— ✅ 已完成
 
 端到端结果:**recall@10 从改造前的 0.80% 提升到 24.00%(约 30 倍)**,NDCG@10 0.0031 → 0.1430,
-在线 P50 **7.4ms**、常驻 73MB、纯 CPU 零推理。
-完整实现细节、8 个 bug 的根因、以及 **18 条可优化点(按预期收益排序)** 见
+在线 P50 **9.1ms**(约束路径 9.4ms)、常驻 73MB、纯 CPU 零推理。
+完整实现细节、10 个 bug 的根因、以及 **21 条可优化点(按预期收益排序)** 见
 [RECOMMENDER.md](RECOMMENDER.md) §10。
+
+**A7 多轮对话(2025 追加)**:修复"再推荐点别的"原样返回上一批的问题。
+补上两样缺失状态 —— **见过哪些**(按 appid + 同名去重)与**说过什么**(25 词封闭词表的偏好过滤),
+并把"命中了几款"写成确定性文案(命中不足 / 完全没命中 / 池子耗尽三档)。
+连续 5 轮换一批零重复,延迟增量 **+0.24ms**。实现记录见 RECOMMENDER.md §11。
 
 ### 方向 B(本地 LLM 推理与调优)—— 计划中
 
@@ -420,7 +459,9 @@ SSE 事件格式(每条 `data: {json}\n\n`):
 
 ### 已知限制(现状)
 
-- **无会话记忆**:没有 checkpointer,多轮上下文靠前端回传 `context.candidates`
+- **无服务端会话记忆**:没有 checkpointer。多轮上下文(已推荐过哪些、用户说过什么偏好)靠前端回传 `context`(见 §7)。**代价:刷新页面后去重记录重置**,会重新看到早先推荐过的游戏
+- **偏好只能落在 25 个词里**:Steam 类型只有 26 个,没有 Horror / Stealth / Roguelike,所以「恐怖」「潜行」这类要求只能如实告诉用户"没有这个标签"(RECOMMENDER.md §11.3)
+- **「换一批」只保证不重复,不保证更不一样**:候选池固定 200 条,没有多样性重排(RECOMMENDER.md §11.11)
 - **无结构化日志**:大量 `except Exception: pass` 吞异常,线上不可观测(P0.2 未做)
 - **LLM 侧仍无评测集/基线数字**:推荐算法侧已建立(P0.4 只完成了方向 A 需要的部分)
 - **`tests/` 仍是平铺结构**:`unittest discover` 会连带加载 torch,单轮 22s(见 RECOMMENDER.md §9.3)

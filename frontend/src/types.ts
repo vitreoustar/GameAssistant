@@ -51,6 +51,22 @@ export interface Candidate {
   metacritic_score: number
   distance: number
   reason?: string
+  pref_match?: string[]
+}
+
+// 多轮推荐的对话状态:偏好 + 已展示过的 appid。
+// 由后端在 done 事件里给出,前端原样回传 —— 服务端不存会话。
+export interface RecommendState {
+  genres: string[]
+  avoid: string[]
+  unmapped: string[]
+  shown: number[]
+  turn: number
+}
+
+export interface ChatTurn {
+  role: 'user' | 'assistant'
+  text: string
 }
 
 export interface GameAnalysis {
@@ -78,6 +94,7 @@ export interface GameCard {
   rating: string
   reason?: string
   match_genres?: string[]
+  pref_match?: string[]
   owned?: boolean
 }
 
@@ -106,6 +123,7 @@ export type StreamEvent =
         candidates: Candidate[] | null
         game_analysis: GameAnalysis | null
         game_candidates: GameCard[] | null
+        recommend_state: RecommendState | null
       }
     }
   | { type: 'error'; data: string }

@@ -36,6 +36,17 @@
 > 换成"多路召回 + LightGBM 精排"，并把 embedding 与 Steam 调用全部离线化之后，
 > recall@10 提升约 30 倍，在线延迟降到毫秒级、零模型推理。
 
+**A7 多轮对话**（§11）在此之上补了两样状态：**见过哪些**（去重）与**说过什么**（偏好过滤）。
+修复前用户说"再推荐点别的"会原样拿到上一批 —— 因为推荐器是游戏库的纯函数，
+对话从未进入排序器。
+
+| 多轮能力 | 实测 |
+|---|---|
+| 连续 5 轮「换一批」 | 25 款零重复、零同名卡片 |
+| 补充「我更喜欢策略类的」 | 5/5 命中并排在前面 |
+| 偏爱词在池里不存在 | `no_match` + 诚实文案 + 替代候选 |
+| 延迟增量 | **+0.24 ms**（P50 9.13 → 9.37 ms） |
+
 ---
 
 ## 1. 数据层（A1）
@@ -446,6 +457,9 @@ item-kNN 走"逐个物品找邻居再累加"，不会质心塌缩，两者互补
 **顺带砍掉 30 次 Steam 请求**：`_profile_for` 优先用离线目录算画像
 （类型/玩法直接从 `catalog.parquet` 读），拿不到时才退回原来的 `appdetails` 版本。
 
+多轮去重与偏好过滤是在这一层之上加的（`exclude_appids` / `prefer` / `avoid` 三个参数），
+详见 §11。
+
 ---
 
 ## 7. 端到端评测与消融（A6）
@@ -516,7 +530,7 @@ item-kNN 走"逐个物品找邻居再累加"，不会质心塌缩，两者互补
 
 ## 8. 工程踩坑清单
 
-实现过程中抓到 **8 个真 bug**，其中 4 个是"数据/指标看起来不对"逼出来的，不是读代码看出来的。
+实现过程中抓到 **10 个真 bug**，其中 5 个是"数据/指标/现象看起来不对"逼出来的，不是读代码看出来的。
 
 | # | 阶段 | 现象 | 根因 | 修法 |
 |---|---|---|---|---|
@@ -528,6 +542,8 @@ item-kNN 走"逐个物品找邻居再累加"，不会质心塌缩，两者互补
 | 6 | A3.2 | **`only:content_user` 测出 9.25%@20，真实值 0.48% —— 虚高 20 倍** | `_merge_by_quota` 的"补齐名额"阶段遍历了**所有**通道而非仅启用通道 | 补齐只看启用通道；**发现方式**：横向对比"全库排序"与"引擎候选"两种口径，37/400 用户判定不一致；已加回归测试 |
 | 7 | A4 | `collab_only` / `popular_only` / 基线跑出**完全相同的数字** | 用"临时改 `engine.config` → 存闭包 → 恢复"切换配置，**恢复得太早**，共享可变状态串台 | 配置绑进闭包；`RecallEngine` 加 `config=` 逐次覆盖参数（顺带可并发） |
 | 8 | A5 | 库覆盖整个候选池时，文案说"你的库里还没有我能识别的游戏" | "库能识别但没剩下可推的"被误标成 `cold_start=True` | 拆开两个语义；单测覆盖 |
+| 9 | A7 | **同名去重"偶尔"失效**，`Counter-Strike: Condition Zero` 连推两次 | `_name_keys` 按 `cat_idx` 索引，却被用**召回池内位置**取用 —— 两个索引空间混用 | 先 `self._name_keys[rows]` 按池内位置重排再取；回归测试在旧实现下**必红**（已双向验证） |
+| 10 | A7 | 多轮文案直接 `AttributeError: 'RecommendationResult' object has no attribute 'unmapped'` | `unmapped` 属于 `PreferenceState` 而不是推荐结果，写文案时想当然当成结果字段 | 显式传参；并补一条**用真的 dataclass** 而非 `SimpleNamespace` 的回归测试（`SimpleNamespace` 测不出字段漂移） |
 
 **两条方法论修正（比 bug 更值钱）**：
 
@@ -535,6 +551,10 @@ item-kNN 走"逐个物品找邻居再累加"，不会质心塌缩，两者互补
    而 seed 噪声是它的 9 倍。**先用真实目标指标量，再决定要不要动架构。**
 2. **常规评测协议可能测的不是你想测的东西**（§3.2）：全库排序协议被热度主导，
    一度让"内容通道"看起来等于随机。加一套**热度匹配**协议后才显形。
+
+> bug 9 与 10 都是被**整图测试**（`tests/test_multiturn_agent.py`）抓出来的，
+> 而不是被单元测试 —— 单元测试里我用 `SimpleNamespace` 造了"假结果"，
+> 它恰好带着 `unmapped` 字段，于是永远测不出真实契约的漂移。**假对象的形状要和真的一样**。
 
 ---
 
@@ -577,16 +597,24 @@ python scripts/train_ranker.py --num-boost-round 600 --early-stopping 60
 
 ```bash
 cd backend
-# 指定模块(推荐):全部离线,~0.7s
+# 指定模块(推荐):全部离线,~0.8s
 python -m unittest tests.test_recommend_features tests.test_recommend_index \
   tests.test_recommend_evaluate tests.test_recommend_recall \
-  tests.test_recommend_rank tests.test_recommend_service tests.test_steam_client
-# 共 87 个用例
+  tests.test_recommend_rank tests.test_recommend_service \
+  tests.test_recommend_preferences tests.test_steam_client
+# 共 129 个用例
+
+# 多轮对话的整图测试(会 import app.agent,连带加载 torch,约 25s)
+python -m unittest tests.test_multiturn_agent
 ```
 
 > ⚠️ 不要用 `unittest discover` 做快速迭代：它会 import 全部 `test_*.py`，
 > 连带加载 torch + sentence-transformers（那 3 个脚本式测试文件），实测 **22.1s**，
 > 而真正跑完只要 **0.2s**。这也是路线图 Phase 0 要拆 `tests/unit` 与 `tests/live` 的原因。
+>
+> 相关教训：`app/agent/__init__.py` 会 `import graph`，所以**任何** `app.agent.*`
+> 的导入都会拉起整条重依赖链。`constraint_note` 因此被挪到
+> `app/recommend/notes.py` —— 一个纯字符串函数不值得让测试等 14 秒。
 
 ---
 
@@ -680,10 +708,260 @@ A3.1 与 A6 都做了多 seed，这里应该补齐，否则"边际贡献"的结�
 - **O17. 测试目录没有拆分** —— 见 §9.3，`unittest discover` 要 22s。
 - **O18. `user_item_csr.npz` 同时被 A4 的特征与协同通道使用**，
   但它是 A2 就落盘的静态产物；如果将来支持增量更新，需要明确它的刷新语义。
+- **O19. 多轮偏好没有强度**（§11.11）—— "更偏向"与"只要"共用同一种硬分桶。
+  做成软约束需要线上反馈来校准权重，而现有留一协议没有对话数据可用。
+- **O20. 「换一批」只是换了位置，没换池子** —— 候选池固定 200 条，
+  5 轮之后就只剩长尾。真正的多样性需要 MMR / 同系列去重（与 O6 同源）。
+- **O21. `parse_message` 的中文关键词表是手工维护的** —— 有 LLM 时不走它，
+  但它决定了"没有 API key 时的体验下限"，且没有测试覆盖所有词条。
 
 ---
 
-## 11. 文件与产物索引
+## 11. 多轮对话（A7）
+
+### 11.1 现象与根因
+
+用户实测发现：
+
+```
+用户：推荐几个游戏
+助手：《A》《B》《C》《D》《E》
+用户：再推荐点别的
+助手：《A》《B》《C》《D》《E》     ← 一字不差
+```
+
+根因不是"忘了传参数"，而是**单轮设计放进多轮场景的结构性缺陷**：
+
+1. `Recommender.recommend()` 是**游戏库的纯函数** —— 输入只有 `games`，没有对话状态。
+   "可复现"在单轮评测里是优点，在多轮对话里就是 bug。
+2. 用户顺口说的"我更喜欢策略类的游戏"只被 LLM 拿去写**推荐理由**，
+   从来没有影响**排序**。理由写着"因为策略类"，卡片却全是动作游戏。
+
+所以这一节补的不是一个 if 判断，而是**两样缺失的状态**：见过哪些（去重）、说过什么（偏好）。
+
+### 11.2 状态放在前端，不放服务端
+
+| 方案 | 优点 | 代价 |
+|---|---|---|
+| 服务端 session（Redis/内存字典） | 前端无感 | 要 TTL、要清理、多进程不一致、重启丢失 |
+| **前端回传（采用）** | 服务无状态、可水平扩展、重启不丢、零清理逻辑 | 刷新页面后去重记录重置 |
+| 落库 | 跨会话记忆 | 需要用户体系，超出当前范围 |
+
+单用户本地部署下，"刷新丢记录"是可接受的取舍，并且**写进文档而不是留成隐性缺陷**。
+
+### 11.3 词表是封闭的 —— 说不出来就承认
+
+Steam 的类型只有 **26 个**，且高度集中：
+
+| 类型 | 物品数 | | 类型 | 物品数 |
+|---|---|---|---|---|
+| Indie | 7,248 | | Strategy | 2,517 |
+| Action | 5,470 | | RPG | 2,394 |
+| Adventure | 4,644 | | Free To Play | 788 |
+| Casual | 3,264 | | Racing | 462 |
+| Simulation | 2,593 | | Gore / Nudity | 6 / 2 |
+
+**没有 Horror、没有 Stealth、没有 Roguelike、没有 Open World。** 这是方向 A 的
+已知数据限制（§10.1 O4），多轮功能把它暴露到了用户面前 —— 用户会直接说"想要恐怖一点的"。
+
+处理方式是**不给模型自由发挥的空间**：
+
+```python
+FILTER_VOCAB = GENRE_VOCAB (15) + FEATURE_VOCAB (10)   # 类型 + 有主题含义的玩法
+```
+
+* 路由 LLM 被要求**只能**从这 25 个词里挑，词表外的词（恐怖/潜行/魂系/开放世界）
+  必须放进 `unmapped`；
+* 服务端 `normalise_terms()` **再校验一遍**，词表外的一律移进 `unmapped`
+  （大小写归一：`rpg` → `RPG`）；
+* 于是 `prefer` 里**永远只可能出现能真正执行的条件**。
+  **宁可说"我没有这个标签"，也不能假装筛过了。**
+
+玩法维度取自 `categories` 列（共 60 个值，大部分是 `Stereo Sound`、`Adjustable Text Size`
+这类技术/无障碍项，只保留 10 个用户会主动提的：`Single-player` / `Multi-player` /
+`Co-op` / `Online Co-op` / `PvP` / `Online PvP` / `Shared/Split Screen` / `MMO` /
+`Steam Workshop` / `In-App Purchases`）。
+
+### 11.4 约束施加在**排序之后**，不是之前
+
+这是整节最关键的设计决定。
+
+直觉做法是"先按类型过滤候选，再排序"。**这会破坏训练/服务一致性**：
+26 维特征里的 `merge_rank` 是候选在 200 条召回池里的**位置**。
+先过滤再排序，送进模型的池子变成另一个分布（长度不同、位置整体前移），
+`merge_rank` 的取值就和训练时不一致 —— 典型的 train/serve skew，离线指标不会报警。
+
+实际流程：
+
+```
+召回 200 条 ──> LightGBM 给【完整池子】打分 ──> 按"是否命中明说偏好"分桶
+                                                    │
+                          ┌─────────────────────────┴──────────────────────┐
+                    matched 桶（命中）                                rest 桶（未命中）
+                   桶内保持精排顺序，先取                              不够 top_k 时再补
+```
+
+一句话概括语义：**用户明说的偏好决定"要不要"，游戏历史决定"要哪个"。**
+桶内的顺序仍然是 LTR 分数，所以"结合用户游戏历史"这个要求没有被牺牲掉。
+
+### 11.5 分桶选品的四条规则与四个标志
+
+| 规则 | 说明 |
+|---|---|
+| 1. 剔除 `exclude`（已展示 appid） | 解决"再推荐点别的" |
+| 2. 剔除命中 `avoid` 的 | 用户说"不要恐怖"就是不要 |
+| 3. 剔除**同名**的 | 见 §11.6 |
+| 4. matched 优先，不够用 rest 补 | 桶内保持精排顺序 |
+
+产出的四个诊断标志（`RecommendationResult`）：
+
+| 标志 | 含义 | 用于 |
+|---|---|---|
+| `matched_count` | 最终列表里命中明说偏好的条数 | 决定文案说"命中几款" |
+| `relaxed` | 命中了但不够，补了不完全符合的 | `True` 时如实说明"只有 N 款严格符合" |
+| `no_match` | **一个都没命中** | `True` 时坦白并给替代方案 |
+| `exhausted` | 池子被去重清空了 | `True` 时提示"能推的都推过了" |
+
+`relaxed` 与 `no_match` 必须分开：一个 5 条里命中 3 条，和一个都没命中，
+是完全不同的处境，糊成一句话就是在骗人。
+
+### 11.6 同名去重：目录里有 319 组同名不同 appid
+
+实测 `catalog.parquet` 里 **319 组**物品名字完全相同但 appid 不同，例如：
+
+| cat_idx | appid | name |
+|---|---|---|
+| 7 | 80 | Counter-Strike: Condition Zero |
+| 8 | 100 | Counter-Strike: Condition Zero |
+
+只按 appid 去重的话，第二轮的候选池里还有另一个 appid 的同名条目，
+用户看到的就是**两张一模一样的卡**。所以去重键是 `(appid, name_key)`：
+
+```python
+def name_key(name) -> str:          # 小写 + 去掉 ™®© + 折叠空白
+    ...
+```
+
+**这里踩了一个极难定位的 bug（§8 bug 9）**：`_name_keys` 是按 `cat_idx` 排的数组，
+而 `picked` 里存的是**池内位置**。两者混用时，"同名去重"只在位置恰好等于 `cat_idx`
+时生效 —— 表现为**随机失效**，单测里因为小目录下位置与 `cat_idx` 常常撞对而通过。
+修法是在使用前先 `self._name_keys[rows]` 按池内位置重排一次，并加了一条
+**在旧实现下必红**的回归测试（已双向验证：改回旧代码 → 2 条测试失败）。
+
+### 11.7 诚实回退：事实由代码说，不由 LLM 说
+
+`constraint_note()`（`app/recommend/notes.py`）是"实话"的唯一来源：
+
+| 处境 | 文案 |
+|---|---|
+| 一个都没命中 | 「说实话,按「X」筛了一遍你库里的 200 个候选,一个都没对上。另外「潜行」这类标签我的数据里没有,只能按类型和玩法这些大类筛。下面这几款是没按你的条件挑的、但和你游戏库最接近的,要不要先看看?」 |
+| 部分命中 | 「严格符合「X」的只有 3 款,剩下 2 款是我按你的库补的相近选择。」 |
+| **说了但一个词都对不上词表** | 「「恐怖」这类标签我的数据里没有(Steam 只分了 Action / RPG / Strategy / Co-op 这些大类,没有更细的主题标签),所以没法按它筛。下面还是按你的游戏库挑的,你看看方向对不对?」 |
+| 全部命中 | （不额外说，避免噪音） |
+| 池子耗尽 | 「能推的我基本都推过一轮了,要不你换个方向,或者放宽一点条件?」 |
+
+> 第三行是**实际踩出来的缺口**：用户说"想找恐怖一点的"，路由正确地把「恐怖」放进了
+> `unmapped`、`prefer` 为空 ⇒ `no_match` 也是 `False` ⇒ 一句提示都没有。
+> 用户完全不会知道自己的要求被忽略了。**"没有反馈"和"假装满足"一样糟糕**，
+> 所以单独加了一个 `prefer` 为空但 `unmapped` 非空的分支。
+
+**为什么不让 LLM 写这段话**：LLM 很擅长把"5 条里命中 3 条"润色成"都符合你的口味"。
+数字由代码算、由代码说；LLM 只负责把**开场白**写得自然，并且提示词里明确要求
+"候选行里没有『对上你说的偏好』就是没对上，理由要如实写"。
+
+同时给每条候选加了 **`pref_match`** 字段（与用户**明说偏好**的重叠），
+和原有的 `match_genres`（与**长期画像**的重叠）区分开 —— 这两个是不同的东西，
+混在一起既写不清理由，也没法排查"为什么推了这条"。
+
+### 11.8 路由顺带抽取偏好：不多花一次 LLM 调用
+
+多轮功能需要"从用户这句话里读出偏好"。单独加一个 LLM 节点最直观，但**每条消息都会多
+300~600ms**，而"判断意图"和"抽偏好"都是"读一句话做分类"，没有理由跑两遍。
+
+所以 `ROUTER_PROMPT` 被扩成同时返回：
+
+```json
+{"intent": "recommend",
+ "pref": {"genres": ["Strategy"], "avoid": [], "unmapped": ["潜行"], "restart": false}}
+```
+
+并给了三条判断规则（写进提示词，每条都对应一个实测场景）：
+
+* 「换一批」/「再推荐点别的」只是要新的一批，**不是**否定之前的偏好；
+* 用户只说偏好、没说要推荐 → 意图用 `recommend`（对应"用户一开始说自己更喜欢某某类型"）；
+* 结合历史对话理解「好」这类省略 —— 上一轮助手问"要不要看看其他类型"，用户答"好"，
+  应判为 `recommend` 且 `restart=true`。
+
+服务端还有一条**兜底升级规则**：即使路由判成 `chat`，只要抽到了具体类型偏好，
+就升级为 `recommend` —— 用户说"我更喜欢策略类的"时，他要的显然是推荐，不是闲聊。
+
+LLM 不可用时走 `parse_message()`：中文关键词表 + 否定词窗口（"不要/不想/别推荐/除了…"）。
+它不追求准确，只保证"没有 API key 也不是完全没反应"。
+
+### 11.9 接线与契约
+
+```
+前端 App.tsx ──context{candidates, recommend, history}──> POST /api/chat
+                                                            │
+                                                    AgentState.recommend_state
+                                                            │
+                                          route_node   抽 intent + pref + 合并状态
+                                                            │
+                                          recommend_node  去重 + 偏好过滤 + 写回新状态
+                                                            │
+       前端保存 <──done.recommend_state──────────────────────┘
+```
+
+| 字段 | 用途 |
+|---|---|
+| `context.candidates` | 上次推荐候选，解析「第 x 个」 |
+| `context.recommend` | `{genres, avoid, unmapped, shown, turn}`，多轮状态 |
+| `context.history` | 最近 8 轮（每轮截 300 字），只为让路由消解省略与指代 |
+
+两个容易翻车的细节：
+
+1. **`recommend_state` 必须无条件更新**，哪怕这一轮一个候选都没给 ——
+   否则下一轮前端拿到的 `shown` 会**回退**，去重记录整体丢失。
+   这一条有专门的单测（`test_state_survives_a_turn_with_no_candidates`）。
+2. **历史用 `useRef` 而不是 state** 读取。`send` 的 `useCallback` 依赖列表里没有
+   `messages`（闭包会过期），而 `useEffect` 同步的 ref 在调用瞬间读到的恰好是
+   **本次发送之前**的消息，正是需要的。
+
+换游戏库时要手动重置状态（`handleLibraryLoaded`）—— 旧的 `shown` 是上一份库的推荐记录，
+留着会让新库一上来就没东西可推。
+
+### 11.10 实测（真实索引，180 款库）
+
+| 场景 | 结果 |
+|---|---|
+| 连续 5 轮「换一批」 | 25 款全部互不重复，同一轮内无同名卡片，无已拥有游戏 |
+| 补充「我更喜欢策略类的」 | `matched=5`，5 款全部带 `pref_match=["Strategy"]` |
+| 补充「不要策略」 | `avoid=["Strategy"]`，结果里 0 条含 Strategy |
+| 偏好一个池里几乎没有的词（Nudity） | `no_match=True` + 诚实文案 + 5 款替代候选 |
+| 延迟增量（交错 A/B，各 200 次） | 无约束 P50 **9.13ms** → 去重+偏好 P50 **9.37ms**，即 **+0.24ms（2.6%）** |
+
+> 延迟增量几乎为零，因为约束全部是 `np.isin` / 布尔索引 / 一次 200 元素的循环，
+> 相比 LightGBM 打分的占比可以忽略。
+
+### 11.11 仍然没解决的（如实列出）
+
+* **偏好只能落在 25 个词里。** "恐怖/潜行/魂系/开放世界"确实筛不了。
+  根治要去拿 Steam 的**细标签**（`appdetails` 的 `tags` 字段或 SteamSpy tags），
+  属于 §10.1 O4 的一部分。
+* **「换一批」只保证"不一样"，不保证"更不一样"。** 候选池仍是同样那 200 条，
+  换个顺序而已。真正的"探索"需要**多样性重排**（MMR / 同系列去重），
+  对应 §10.1 O6，目前没做 —— 实测输出里 `Tomb Raider GOTY` 与
+  `Shadow of the Tomb Raider` 仍会同时出现。
+* **偏好没有强度。"** 更偏向策略"和"只要策略"现在是同一种硬分桶。
+  更自然的做法是把偏好做成**软约束**（在 LTR 分数上加权），但加权系数需要
+  用线上反馈校准 —— 现有离线协议（留一）无法评估"多轮偏好"这件事，
+  因为数据集里没有对话。
+* **状态在客户端，刷新即丢。** 单用户场景可接受，多用户产品需要 session。
+* **没有跨会话记忆。** "上次你说喜欢策略类，这次还按这个来吗" 需要用户体系。
+
+---
+
+## 12. 文件与产物索引
 
 ### 代码
 
@@ -694,7 +972,9 @@ A3.1 与 A6 都做了多 seed，这里应该补齐，否则"边际贡献"的结�
 | `app/recommend/recall.py` | 5 路通道 + 配额轮转融合（`RecallEngine`） |
 | `app/recommend/rank.py` | 26 维 `FeatureBuilder`（训练/线上共用）+ `Ranker` |
 | `app/recommend/evaluate.py` | 留一切分 + 两套协议 + 排序指标 |
-| `app/recommend/service.py` | 对外门面 `Recommender` + 懒加载单例 |
+| `app/recommend/service.py` | 对外门面 `Recommender` + 懒加载单例（含多轮去重与偏好分桶） |
+| `app/recommend/preferences.py` | A7 对话偏好状态机 + 封闭词表 + 关键词兜底抽取 |
+| `app/recommend/notes.py` | A7 约束文案（"命中了几款"的确定性实话，纯标准库） |
 | `app/routers/recommend.py` | `POST /api/recommend` |
 | `scripts/build_interactions.py` | A1.2 数据落盘 |
 | `scripts/build_recommend_index.py` | A2 离线索引 |
@@ -725,5 +1005,7 @@ data/recommend/        catalog.parquet content_emb.npy content_topk.npz collab_t
 | `tests/test_recommend_recall.py` | 8 | 通道隔离 / 配额语义 / 拥有排除 / 权重语义 |
 | `tests/test_recommend_rank.py` | 10 | 特征维度与顺序 / 哨兵值 / 类型与发行商特征 / **泄漏守卫** |
 | `tests/test_recommend_service.py` | 11 | 冷启动三路径 / 解释来源 / 前端契约 |
+| `tests/test_recommend_preferences.py` | 42 | 偏好状态机 / 封闭词表 / 关键词抽取 / **多轮去重** / 偏好分桶 / **同名去重** / 约束文案 |
+| `tests/test_multiturn_agent.py` | 6 | 整图多轮:两轮不重复 / 偏好进入排序 / `shown` 不丢失（**会加载 torch，约 23s**） |
 | `tests/test_steam_client.py` | 11 | 令牌桶限速 / TTL 缓存 / DLC 纯函数 |
-| **合计** | **87** | 全部离线，~0.7s |
+| **合计** | **129** | 前 7 行全部离线，~0.8s |
